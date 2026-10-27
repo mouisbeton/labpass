@@ -1,4 +1,4 @@
-from .items import decrypt_item, encrypt_item
+from .items import APP_CIPHERS, BENCHMARK_CIPHERS, decrypt_item, encrypt_item
 from .keys import (
     IntegrityError,
     derive_keys,
@@ -10,6 +10,8 @@ from .keys import (
 
 __all__ = [
     "decrypt_item",
+    "APP_CIPHERS",
+    "BENCHMARK_CIPHERS",
     "IntegrityError",
     "derive_keys",
     "new_item_secret",

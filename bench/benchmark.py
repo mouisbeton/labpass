@@ -18,6 +18,7 @@ What it measures:
     2. storage overhead (ciphertext size - plaintext size)
     3. key cost: derive_keys, wrap_secret, unwrap_secret
     4. upload cost: new secret + wrap + encrypt, for all three app ciphers
+    5. HMAC-SHA256 alone over the same 1 MiB chunks, to split cipher time from MAC time
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -257,6 +260,45 @@ def bench_upload(sizes, warmup, runs, enc, raw_rows) -> list[dict]:
     return rows
 
 
+# ------------------------------------------------------- 5. HMAC alone
+
+CHUNK_SIZE = 1 * MiB  # same chunk size as labcrypto
+AAD_BYTES = 64        # roughly the size of context + chunk header labcrypto MACs
+
+
+def mac_only(key: bytes, data: bytes) -> None:
+    """HMAC-SHA256 over every 1 MiB chunk, the way labcrypto does it for DES and RC4
+    (hmac.new(mac_key, aad + body, sha256) per chunk, including the aad + body copy)."""
+    aad = b"\x00" * AAD_BYTES
+    for start in range(0, max(len(data), 1), CHUNK_SIZE):
+        hmac.new(key, aad + data[start:start + CHUNK_SIZE], hashlib.sha256).digest()
+
+
+def bench_mac(sizes, warmup, runs, raw_rows) -> list[dict]:
+    """Time the MAC on its own, so the analysis can split DES/RC4/AES-CBC time
+    into 'cipher' and 'HMAC' parts (both CBC ciphers pay the same HMAC cost)."""
+    print("HMAC-SHA256 alone (median MiB/s)")
+    key = os.urandom(32)
+    rows = []
+    for size in sizes:
+        data = os.urandom(size)
+        inner = max(1, MIN_BYTES_PER_RUN // size)
+        times = []
+        for r in range(warmup + runs):
+            t = timed(lambda: mac_only(key, data), inner)
+            if r >= warmup:
+                times.append(t)
+                raw_rows.append({"test": "mac", "size_bytes": size, "run": r - warmup, "seconds": t})
+        s = summarize(times)
+        mib_s = size / MiB / s["median_s"]
+        rows.append({"size_bytes": size, "size": size_label(size), "inner_reps": inner, **s,
+                     "median_mib_s": mib_s})
+        print(f"  {size_label(size):>8}  {mib_s:8.1f} MiB/s   cv {s['cv_pct']:5.1f}%")
+        del data
+    print()
+    return rows
+
+
 # ----------------------------------------------------------------- output
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -276,7 +318,7 @@ def main() -> None:
     p.add_argument("--quick", action="store_true", help="small sizes, 3 runs (smoke test)")
     p.add_argument("--runs", type=int, help="timed runs per measurement (default 10, quick 3)")
     p.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs (default 1)")
-    p.add_argument("--skip", nargs="*", default=[], choices=("keys", "ciphers", "upload"))
+    p.add_argument("--skip", nargs="*", default=[], choices=("keys", "ciphers", "upload", "mac"))
     p.add_argument("--ciphers", nargs="+", choices=BENCH_CIPHERS, default=list(BENCH_CIPHERS),
                    help="only these ciphers (default: all four)")
     args = p.parse_args()
@@ -304,6 +346,8 @@ def main() -> None:
         results["cipher_speed"] = bench_ciphers(sizes, args.warmup, runs, enc, dec, raw_rows, ciphers)
     if "upload" not in args.skip:
         results["upload_cost"] = bench_upload(sizes, args.warmup, runs, enc, raw_rows)
+    if "mac" not in args.skip:
+        results["mac_cost"] = bench_mac(sizes, args.warmup, runs, raw_rows)
 
     # Summaries for the report go in results/ (committable) only for an all-real,
     # full run of every cipher. Stub, quick and subset runs stay in raw/ (gitignored).

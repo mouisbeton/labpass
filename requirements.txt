@@ -1,0 +1,3 @@
+argon2-cffi>=23.1,<26
+pycryptodome>=3.20,<4
+pytest>=7,<9

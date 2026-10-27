@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv*/
+.venv/
+
+# Runtime data (database, secret key) - never commit
+data/
+
+# Raw benchmark dumps (commit only summarised CSVs/charts)
+bench/results/raw/
+
+# Generated sample files (regenerate with samples/make_samples.py)
+samples/out/

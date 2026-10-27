@@ -1,12 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# Virtual environments
-venv*/
-.venv/
-
 # Runtime data (database, secret key) - never commit
 data/
 
@@ -15,3 +6,46 @@ bench/results/raw/
 
 # Generated sample files (regenerate with samples/make_samples.py)
 samples/out/
+
+# ==========================================
+# Database (Sesuai Permintaan)
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+labaccess.db
+
+# ==========================================
+# Storage Berkas Blob Terenkripsi
+# ==========================================
+blobs/
+blobs/*
+!blobs/.gitkeep
+
+# ==========================================
+# Python Runtime & Bytecode Cache
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# ==========================================
+# Environment & Secret Configurations
+# ==========================================
+.env
+.env.local
+venv/
+.venv/
+env/
+ENV/
+
+# ==========================================
+# IDE & System Cache Files
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

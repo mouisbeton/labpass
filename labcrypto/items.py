@@ -24,8 +24,8 @@ from .keys import (
 
 
 CHUNK_SIZE: Final = 1024 * 1024
-APP_CIPHERS: Final = frozenset({"aes-gcm", "des-cbc", "rc4"})
-BENCHMARK_CIPHERS: Final = frozenset({"aes-cbc"})
+APP_CIPHERS: Final = ("aes-gcm", "des-cbc", "rc4")
+BENCHMARK_CIPHERS: Final = APP_CIPHERS + ("aes-cbc",)
 _MAGIC: Final = b"LAC1"
 _NONCE_LENGTH: Final = 12
 _DES_IV_LENGTH: Final = 8
@@ -108,7 +108,7 @@ def encrypt_item(
     ctx: ItemContext,
 ) -> bytes:
     """Encrypt an item; use a new item secret for every write."""
-    if cipher_name not in APP_CIPHERS | BENCHMARK_CIPHERS:
+    if cipher_name not in BENCHMARK_CIPHERS:
         raise ValueError("unsupported cipher")
     if not isinstance(plaintext, bytes):
         raise TypeError("plaintext must be bytes")
@@ -168,7 +168,7 @@ def decrypt_item(
     item_secret: bytes,
     ctx: ItemContext,
 ) -> bytes:
-    if cipher_name not in APP_CIPHERS | BENCHMARK_CIPHERS:
+    if cipher_name not in BENCHMARK_CIPHERS:
         raise ValueError("unsupported cipher")
     if not isinstance(blob, bytes):
         raise TypeError("blob must be bytes")

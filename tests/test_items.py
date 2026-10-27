@@ -19,7 +19,7 @@ PREFIX_LENGTH = 4 + 16
 HEADER_LENGTH = 9
 
 
-@pytest.fixture(params=["aes-gcm", "aes-cbc", "des-cbc", "rc4"])
+@pytest.fixture(params=BENCHMARK_CIPHERS)
 def cipher_name(request):
     return request.param
 
@@ -60,21 +60,16 @@ def test_item_round_trip(cipher_name, plaintext):
     assert decrypt_item(cipher_name, blob, item_secret, ctx) == plaintext
 
 
-def test_des_cbc_rejects_tampered_body_and_tag():
+@pytest.mark.parametrize("cipher_name", ["aes-cbc", "des-cbc", "rc4"])
+def test_cbc_and_rc4_reject_tampered_tag(cipher_name):
     item_secret = new_item_secret()
-    ctx = ("student-1", "item-1", "des-cbc")
-    blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["des-cbc"])
-
-    chunks[0][1][8] ^= 1
-    with pytest.raises(IntegrityError):
-        decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
-
-    blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["des-cbc"])
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
     chunks[0][2][0] ^= 1
+
     with pytest.raises(IntegrityError):
-        decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks), item_secret, ctx)
 
 
 @pytest.mark.parametrize("cipher_name", ["des-cbc", "aes-cbc"])
@@ -98,43 +93,9 @@ def test_cbc_verifies_before_decrypting(monkeypatch, cipher_name):
 
 
 def test_cipher_sets_separate_application_and_benchmark_ciphers():
-    assert APP_CIPHERS == frozenset({"aes-gcm", "des-cbc", "rc4"})
-    assert BENCHMARK_CIPHERS == frozenset({"aes-cbc"})
-    assert APP_CIPHERS.isdisjoint(BENCHMARK_CIPHERS)
-
-
-def test_rc4_rejects_tampered_body_and_tag():
-    item_secret = new_item_secret()
-    ctx = ("student-1", "item-1", "rc4")
-    blob = encrypt_item("rc4", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["rc4"])
-
-    chunks[0][1][0] ^= 1
-    with pytest.raises(IntegrityError):
-        decrypt_item("rc4", join_chunks(prefix, chunks), item_secret, ctx)
-
-    blob = encrypt_item("rc4", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["rc4"])
-    chunks[0][2][0] ^= 1
-    with pytest.raises(IntegrityError):
-        decrypt_item("rc4", join_chunks(prefix, chunks), item_secret, ctx)
-
-
-def test_aes_cbc_rejects_tampered_body_and_tag():
-    item_secret = new_item_secret()
-    ctx = ("student-1", "item-1", "aes-cbc")
-    blob = encrypt_item("aes-cbc", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-cbc"])
-
-    chunks[0][1][16] ^= 1
-    with pytest.raises(IntegrityError):
-        decrypt_item("aes-cbc", join_chunks(prefix, chunks), item_secret, ctx)
-
-    blob = encrypt_item("aes-cbc", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-cbc"])
-    chunks[0][2][0] ^= 1
-    with pytest.raises(IntegrityError):
-        decrypt_item("aes-cbc", join_chunks(prefix, chunks), item_secret, ctx)
+    assert APP_CIPHERS == ("aes-gcm", "des-cbc", "rc4")
+    assert BENCHMARK_CIPHERS == APP_CIPHERS + ("aes-cbc",)
+    assert "aes-cbc" not in APP_CIPHERS
 
 
 def test_wrong_context_and_secret_fail_authentication():
@@ -193,62 +154,67 @@ def test_cipher_name_must_match_context():
     assert type(excinfo.value) is ValueError
 
 
-def test_reordered_chunks_fail():
+def test_reordered_chunks_fail(cipher_name):
     item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", cipher_name)
     plaintext = b"a" * (CHUNK_SIZE * 2)
-    blob = encrypt_item("aes-gcm", plaintext, item_secret, CTX)
+    blob = encrypt_item(cipher_name, plaintext, item_secret, ctx)
 
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-gcm"])
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
     reordered = join_chunks(prefix, [chunks[1], chunks[0]])
 
     with pytest.raises(IntegrityError):
-        decrypt_item("aes-gcm", reordered, item_secret, CTX)
+        decrypt_item(cipher_name, reordered, item_secret, ctx)
 
 
-def test_reordered_chunks_with_rewritten_headers_fail():
+def test_reordered_chunks_with_rewritten_headers_fail(cipher_name):
     item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", cipher_name)
     plaintext = b"a" * (CHUNK_SIZE * 2)
-    blob = encrypt_item("aes-gcm", plaintext, item_secret, CTX)
+    blob = encrypt_item(cipher_name, plaintext, item_secret, ctx)
 
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-gcm"])
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
     chunks[0], chunks[1] = chunks[1], chunks[0]
     struct.pack_into(">IBI", chunks[0][0], 0, 0, 0, len(chunks[0][1]))
     struct.pack_into(">IBI", chunks[1][0], 0, 1, 1, len(chunks[1][1]))
 
     with pytest.raises(IntegrityError):
-        decrypt_item("aes-gcm", join_chunks(prefix, chunks), item_secret, CTX)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks), item_secret, ctx)
 
 
-def test_flipped_body_byte_fails():
+def test_flipped_body_byte_fails(cipher_name):
     item_secret = new_item_secret()
-    blob = encrypt_item("aes-gcm", b"a" * CHUNK_SIZE, item_secret, CTX)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-gcm"])
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"a" * CHUNK_SIZE, item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
     chunks[0][1][0] ^= 1
 
     with pytest.raises(IntegrityError):
-        decrypt_item("aes-gcm", join_chunks(prefix, chunks), item_secret, CTX)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks), item_secret, ctx)
 
 
-def test_blob_cannot_be_swapped_between_students():
+def test_blob_cannot_be_swapped_between_students(cipher_name):
     item_secret = new_item_secret()
-    blob = encrypt_item("aes-gcm", b"private", item_secret, CTX)
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"private", item_secret, ctx)
 
     with pytest.raises(IntegrityError):
         decrypt_item(
-            "aes-gcm",
+            cipher_name,
             blob,
             new_item_secret(),
-            ("student-2", "item-1", "aes-gcm"),
+            ("student-2", "item-1", cipher_name),
         )
 
 
-def test_deleted_final_chunk_fails():
+def test_deleted_final_chunk_fails(cipher_name):
     item_secret = new_item_secret()
-    blob = encrypt_item("aes-gcm", b"a" * (CHUNK_SIZE + 1), item_secret, CTX)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-gcm"])
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"a" * (CHUNK_SIZE + 1), item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
 
     with pytest.raises(IntegrityError, match="no final chunk"):
-        decrypt_item("aes-gcm", join_chunks(prefix, chunks[:-1]), item_secret, CTX)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks[:-1]), item_secret, ctx)
 
 
 def test_deleted_final_chunk_with_moved_last_flag_fails(cipher_name):

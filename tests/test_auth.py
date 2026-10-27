@@ -11,12 +11,12 @@ import sqlite3
 from datetime import date
 
 import pytest
-from flask import Flask
+from flask import Flask, g, session
 
 import auth
 import database
 import session_cache
-from labcrypto import derive_keys
+from labcrypto import IntegrityError, derive_keys, new_item_secret, unwrap_secret, wrap_secret
 
 TEMPLATES = os.path.join(os.path.dirname(__file__), "..", "templates")
 
@@ -38,6 +38,7 @@ def _make_app(tmp_path, monkeypatch, csrf_enabled):
     app.config.update(TESTING=True, SECRET_KEY="test", WTF_CSRF_ENABLED=csrf_enabled)
     auth.init_app(app)
     app.add_url_rule("/dashboard", "dashboard", lambda: "dashboard")
+    app.add_url_rule("/secret", "secret", auth.login_required(lambda: g.user_id))
     return app
 
 
@@ -298,3 +299,254 @@ def test_logging_in_twice_gives_a_new_sid(registered):
     assert first != second
     # the first session's KEK was wiped, not left behind
     assert list(session_cache._entries) == [second]
+
+
+# Login required
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def logged_in(registered, monkeypatch):
+    # A fake clock so tests can jump forward without waiting
+    clock = FakeClock()
+    monkeypatch.setattr(session_cache, "_clock", clock)
+    registered.post("/login", data=LOGIN_FORM)
+    registered.clock = clock
+    return registered
+
+
+def _user_id():
+    return _rows("SELECT id FROM users WHERE username = 'kucing.oren'")[0]["id"]
+
+
+def test_protected_route_redirects_when_logged_out(registered):
+    response = registered.get("/secret")
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/login"
+
+
+def test_protected_route_shows_user_id_when_logged_in(logged_in):
+    response = logged_in.get("/secret")
+    assert response.status_code == 200
+    assert response.data.decode() == _user_id()
+
+
+def test_protected_route_redirects_after_16_minutes_idle(logged_in):
+    logged_in.clock.now += 16 * 60
+    response = logged_in.get("/secret")
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/login"
+
+
+def test_get_kek_returns_the_cached_kek(logged_in):
+    with logged_in.session_transaction() as s:
+        sid = s["sid"]
+    _, expected = session_cache.get(sid)
+    with logged_in.application.test_request_context():
+        session["sid"] = sid
+        assert auth.get_kek() == expected
+
+
+# Change password
+
+
+NEW_PASSWORD = "kata-sandi-baru-panjang"
+CHANGE_FORM = {
+    "old_password": VALID_FORM["password"],
+    "new_password": NEW_PASSWORD,
+    "new_password_confirm": NEW_PASSWORD,
+}
+
+
+# Store one fake item with a key wrapped under the KEK of the given password; return its secret
+def _add_wrapped_item(user_id, password, item_id="item-1", cipher="aes-gcm"):
+    conn = sqlite3.connect(database.DB_PATH)
+    salt = conn.execute("SELECT salt FROM users WHERE id = ?", (user_id,)).fetchone()[0]
+    _, kek = derive_keys(password, salt)
+    secret = new_item_secret()
+    conn.execute(
+        "INSERT INTO items (id, user_id, filename_enc, mime_type_enc, sha256_orig) VALUES (?, ?, ?, ?, ?)",
+        (item_id, user_id, b"name", b"mime", "0" * 64),
+    )
+    conn.execute(
+        "INSERT INTO wrapped_keys (item_id, cipher, wrapped_secret) VALUES (?, ?, ?)",
+        (item_id, cipher, wrap_secret(kek, secret, (user_id, item_id, cipher))),
+    )
+    conn.commit()
+    conn.close()
+    return secret
+
+
+def test_change_password_page_loads(logged_in):
+    response = logged_in.get("/change-password")
+    assert response.status_code == 200
+    assert b"Change Password" in response.data
+
+
+def test_change_password_requires_login(registered):
+    assert registered.post("/change-password", data=CHANGE_FORM).status_code == 302
+
+
+def test_change_password_with_wrong_old_password_changes_nothing(logged_in):
+    before = _rows("SELECT salt, login_key FROM users")[0]
+    response = logged_in.post(
+        "/change-password", data={**CHANGE_FORM, "old_password": "password-yang-salah"}
+    )
+    assert response.status_code == 401
+    after = _rows("SELECT salt, login_key FROM users")[0]
+    assert (after["salt"], after["login_key"]) == (before["salt"], before["login_key"])
+
+
+def test_change_password_rejects_short_new_password(logged_in):
+    response = logged_in.post(
+        "/change-password",
+        data={**CHANGE_FORM, "new_password": "pendek", "new_password_confirm": "pendek"},
+    )
+    assert response.status_code == 400
+
+
+def test_change_password_swaps_old_for_new(logged_in):
+    response = logged_in.post("/change-password", data=CHANGE_FORM)
+    assert response.status_code == 302
+
+    with logged_in.application.app_context():
+        assert auth.check_login("kucing.oren", VALID_FORM["password"]) is None
+        assert auth.check_login("kucing.oren", NEW_PASSWORD) is not None
+
+
+def test_change_password_rewraps_item_keys_for_the_new_kek(logged_in):
+    user_id = _user_id()
+    secret = _add_wrapped_item(user_id, VALID_FORM["password"])
+
+    logged_in.post("/change-password", data=CHANGE_FORM)
+
+    new_salt_value = _rows("SELECT salt FROM users")[0]["salt"]
+    _, new_kek = derive_keys(NEW_PASSWORD, new_salt_value)
+    wrapped = _rows("SELECT wrapped_secret FROM wrapped_keys")[0]["wrapped_secret"]
+    ctx = (user_id, "item-1", "aes-gcm")
+    assert unwrap_secret(new_kek, wrapped, ctx) == secret
+
+    _, old_kek = derive_keys(VALID_FORM["password"], new_salt_value)
+    with pytest.raises(IntegrityError):
+        unwrap_secret(old_kek, wrapped, ctx)
+
+
+def test_change_password_keeps_the_student_logged_in_with_the_new_kek(logged_in):
+    logged_in.post("/change-password", data=CHANGE_FORM)
+    assert logged_in.get("/secret").status_code == 200
+
+    with logged_in.session_transaction() as s:
+        _, cached_kek = session_cache.get(s["sid"])
+    _, new_kek = derive_keys(NEW_PASSWORD, _rows("SELECT salt FROM users")[0]["salt"])
+    assert cached_kek == new_kek
+
+
+def test_change_password_with_tampered_key_changes_nothing(logged_in):
+    user_id = _user_id()
+    _add_wrapped_item(user_id, VALID_FORM["password"])
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute("UPDATE wrapped_keys SET wrapped_secret = ?", (b"x" * 60,))
+    conn.commit()
+    conn.close()
+    before = _rows("SELECT salt, login_key FROM users")[0]
+
+    response = logged_in.post("/change-password", data=CHANGE_FORM)
+
+    assert response.status_code == 500
+    after = _rows("SELECT salt, login_key FROM users")[0]
+    assert (after["salt"], after["login_key"]) == (before["salt"], before["login_key"])
+
+
+# Withdraw consent
+
+
+def _add_blob_copy(user_id, item_id, blob_path):
+    blob_path.write_bytes(b"ciphertext")
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute(
+        "INSERT INTO copies (id, item_id, cipher, blob_path) VALUES (?, ?, ?, ?)",
+        (f"copy-{item_id}", item_id, "aes-gcm", str(blob_path)),
+    )
+    conn.commit()
+    conn.close()
+
+
+WITHDRAW_FORM = {"password": VALID_FORM["password"]}
+
+
+def test_withdraw_consent_page_loads(logged_in):
+    response = logged_in.get("/withdraw-consent")
+    assert response.status_code == 200
+    assert b"Withdraw Consent" in response.data
+
+
+def test_withdraw_consent_requires_login(registered):
+    assert registered.post("/withdraw-consent").status_code == 302
+    assert len(_rows("SELECT * FROM users")) == 1
+
+
+@pytest.mark.parametrize("form", [{}, {"password": "password-yang-salah"}])
+def test_withdraw_consent_with_wrong_password_deletes_nothing(logged_in, tmp_path, form):
+    user_id = _user_id()
+    _add_wrapped_item(user_id, VALID_FORM["password"])
+    blob = tmp_path / "blob-1"
+    _add_blob_copy(user_id, "item-1", blob)
+
+    response = logged_in.post("/withdraw-consent", data=form)
+
+    assert response.status_code == 401
+    for table in ("users", "items", "copies", "wrapped_keys", "consents"):
+        assert len(_rows(f"SELECT * FROM {table}")) == 1, table
+    assert blob.exists()
+    # still logged in
+    assert logged_in.get("/secret").status_code == 200
+
+
+def test_withdraw_consent_deletes_all_of_the_students_data(logged_in, tmp_path):
+    user_id = _user_id()
+    _add_wrapped_item(user_id, VALID_FORM["password"])
+    blob = tmp_path / "blob-1"
+    _add_blob_copy(user_id, "item-1", blob)
+
+    response = logged_in.post("/withdraw-consent", data=WITHDRAW_FORM)
+
+    assert response.status_code == 302
+    for table in ("users", "items", "copies", "wrapped_keys", "consents"):
+        assert _rows(f"SELECT * FROM {table}") == [], table
+    assert not blob.exists()
+
+
+def test_withdraw_consent_ends_the_session(logged_in):
+    logged_in.post("/withdraw-consent", data=WITHDRAW_FORM)
+    assert session_cache._entries == {}
+    assert logged_in.get("/secret").status_code == 302
+
+
+def test_withdraw_consent_old_password_no_longer_works(logged_in):
+    logged_in.post("/withdraw-consent", data=WITHDRAW_FORM)
+    assert logged_in.post("/login", data=LOGIN_FORM).status_code == 401
+
+
+def test_withdraw_consent_leaves_other_students_untouched(logged_in, tmp_path):
+    other_form = {**VALID_FORM, "username": "anjing.hitam"}
+    logged_in.post("/register", data=other_form)
+    other_id = _rows("SELECT id FROM users WHERE username = 'anjing.hitam'")[0]["id"]
+    _add_wrapped_item(other_id, other_form["password"], item_id="item-other")
+    other_blob = tmp_path / "blob-other"
+    _add_blob_copy(other_id, "item-other", other_blob)
+
+    logged_in.post("/withdraw-consent", data=WITHDRAW_FORM)
+
+    assert [r["id"] for r in _rows("SELECT id FROM users")] == [other_id]
+    assert len(_rows("SELECT * FROM items")) == 1
+    assert len(_rows("SELECT * FROM copies")) == 1
+    assert len(_rows("SELECT * FROM wrapped_keys")) == 1
+    assert len(_rows("SELECT * FROM consents")) == 1
+    assert other_blob.exists()

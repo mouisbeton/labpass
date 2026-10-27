@@ -4,6 +4,7 @@ Run from the repo root:
     python -m bench.benchmark            # full run (1 KiB .. 100 MiB, 10 runs)
     python -m bench.benchmark --quick    # fast smoke test (small sizes, 3 runs)
     python -m bench.benchmark --backend stub
+    python -m bench.benchmark --ciphers aes-gcm des-cbc   # only some ciphers (results stay in raw/)
 
 Backends:
     real  - labcrypto.encrypt_item / decrypt_item (person 1's module, same code as the app);
@@ -56,7 +57,7 @@ def size_label(n: int) -> str:
     return f"{n // MiB} MiB" if n >= MiB else f"{n // KiB} KiB"
 
 
-def load_backend(name: str):
+def load_backend(name: str, ciphers=BENCH_CIPHERS):
     """Pick real or stub code per cipher.
 
     Person 1 adds ciphers one at a time, so in auto mode each cipher uses the
@@ -74,7 +75,7 @@ def load_backend(name: str):
             pass
 
     sources = {}
-    for c in BENCH_CIPHERS:
+    for c in ciphers:
         sources[c] = "stub"
         if real_enc is None:
             continue
@@ -178,9 +179,9 @@ def bench_keys(warmup: int, runs: int, raw_rows: list) -> list[dict]:
 
 # ------------------------------------------------- 1+2. cipher speed, overhead
 
-def bench_ciphers(sizes, warmup, runs, enc, dec, raw_rows) -> list[dict]:
+def bench_ciphers(sizes, warmup, runs, enc, dec, raw_rows, ciphers=BENCH_CIPHERS) -> list[dict]:
     print("Cipher speed (median MiB/s)")
-    ciphers = list(BENCH_CIPHERS)
+    ciphers = list(ciphers)
     rows = []
     for size in sizes:
         data = os.urandom(size)  # generated outside the timer
@@ -276,14 +277,23 @@ def main() -> None:
     p.add_argument("--runs", type=int, help="timed runs per measurement (default 10, quick 3)")
     p.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs (default 1)")
     p.add_argument("--skip", nargs="*", default=[], choices=("keys", "ciphers", "upload"))
+    p.add_argument("--ciphers", nargs="+", choices=BENCH_CIPHERS, default=list(BENCH_CIPHERS),
+                   help="only these ciphers (default: all four)")
     args = p.parse_args()
 
-    backend, sources, enc, dec = load_backend(args.backend)
+    ciphers = [c for c in BENCH_CIPHERS if c in args.ciphers]  # keep the fixed order
+    subset = len(ciphers) < len(BENCH_CIPHERS)
+    if subset and "upload" not in args.skip and not set(APP_CIPHERS) <= set(ciphers):
+        print("Upload cost needs all three app ciphers -> skipped for this run.\n")
+        args.skip.append("upload")
+
+    backend, sources, enc, dec = load_backend(args.backend, ciphers)
     sizes = QUICK_SIZES if args.quick else FULL_SIZES
     runs = args.runs or (3 if args.quick else 10)
     info = machine_info(backend)
     info["cipher_code"] = sources
-    info.update(sizes=[size_label(s) for s in sizes], runs=runs, warmup=args.warmup, quick=args.quick)
+    info.update(sizes=[size_label(s) for s in sizes], runs=runs, warmup=args.warmup, quick=args.quick,
+                subset=subset)
     print(json.dumps(info, indent=2), "\n")
 
     raw_rows: list[dict] = []
@@ -291,18 +301,19 @@ def main() -> None:
     if "keys" not in args.skip:
         results["key_cost"] = bench_keys(args.warmup, runs, raw_rows)
     if "ciphers" not in args.skip:
-        results["cipher_speed"] = bench_ciphers(sizes, args.warmup, runs, enc, dec, raw_rows)
+        results["cipher_speed"] = bench_ciphers(sizes, args.warmup, runs, enc, dec, raw_rows, ciphers)
     if "upload" not in args.skip:
         results["upload_cost"] = bench_upload(sizes, args.warmup, runs, enc, raw_rows)
 
-    # Summaries for the report go in results/ (committable) only for the real
-    # backend on a full run. Stub and quick runs stay in raw/ (gitignored).
+    # Summaries for the report go in results/ (committable) only for an all-real,
+    # full run of every cipher. Stub, quick and subset runs stay in raw/ (gitignored).
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     raw_dir = RESULTS_DIR / "raw"
-    if backend == "real" and not args.quick:
+    if backend == "real" and not args.quick and not subset:
         out_dir = RESULTS_DIR
     else:
-        out_dir = raw_dir / f"{backend}{'-quick' if args.quick else ''}"
+        tag = "-".join(ciphers) if subset else ""
+        out_dir = raw_dir / "-".join(x for x in (backend, tag, "quick" if args.quick else "") if x)
     for name, rows in results.items():
         write_csv(out_dir / f"{name}.csv", rows)
     (out_dir / "machine.json").parent.mkdir(parents=True, exist_ok=True)

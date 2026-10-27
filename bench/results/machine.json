@@ -1,0 +1,28 @@
+{
+  "date": "2026-10-27T22:22:29",
+  "backend": "real",
+  "os": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel",
+  "cpu_count": 22,
+  "python": "3.13.3",
+  "pycryptodome": "3.24.1",
+  "argon2-cffi": "25.1.0",
+  "cipher_code": {
+    "aes-gcm": "real",
+    "des-cbc": "real",
+    "rc4": "real",
+    "aes-cbc": "real"
+  },
+  "sizes": [
+    "1 KiB",
+    "100 KiB",
+    "1 MiB",
+    "10 MiB",
+    "50 MiB",
+    "100 MiB"
+  ],
+  "runs": 10,
+  "warmup": 1,
+  "quick": false,
+  "subset": false
+}

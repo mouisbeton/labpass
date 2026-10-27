@@ -19,11 +19,11 @@ from flask import (
     render_template,
     request,
     send_file,
-    session,
     url_for,
 )
 
-from database import close_db, get_db, init_db
+import auth
+from database import get_db
 from storage import delete_blob_file, read_blob_data, save_blob_data
 
 # ==============================================================================
@@ -88,34 +88,9 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 # var secret key untuk cookie sesi Flask
 app.secret_key = os.urandom(24)
 
-# daftarkan fungsi penutup koneksi database pada teardown app context
-app.teardown_appcontext(close_db)
-
-
-# middleware penyiapan sesi dan user context sebelum request diproses
-@app.before_request
-def load_logged_in_user():
-    # var mengambil ID pengguna dari cookie sesi
-    user_id = session.get("user_id")
-
-    # cek apakah user_id tersedia dalam sesi
-    if user_id is None:
-        g.user = None
-    else:
-        # ambil data profil pengguna dari database SQLite
-        db = get_db()
-        g.user = db.execute(
-            "SELECT * FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
-
-
-# helper decorator / checker untuk rute terproteksi login
-def require_auth():
-    # cek apakah g.user terisi
-    if g.user is None:
-        return False
-    return True
-
+# pasang modul auth: CSRF, flag cookie sesi, tabel users/consents, teardown database,
+# serta rute /register, /login, /logout, /change-password, /withdraw-consent
+auth.init_app(app)
 
 # ==============================================================================
 # FLASK ROUTES
@@ -125,34 +100,29 @@ def require_auth():
 # Rute utama dasbor: menampilkan daftar berkas milik pengguna yang sedang login
 @app.route("/")
 @app.route("/dashboard")
+@auth.login_required
 def dashboard():
-    # percabangan mengecek apakah pengguna sudah login
-    if not require_auth():
-        # alihkan ke halaman login jika belum login
-        return redirect(url_for("login_stub"))
-
-    # var koneksi basis data SQLite
     db = get_db()
+    # nama pengguna untuk sapaan di dasbor
+    username = db.execute(
+        "SELECT username FROM users WHERE id = ?", (g.user_id,)
+    ).fetchone()["username"]
     # var mengambil daftar berkas milik pengguna saat ini (Ownership Check via WHERE user_id)
     items = db.execute(
         "SELECT id, sha256_orig, created_at FROM items WHERE user_id = ? ORDER BY created_at DESC",
-        (g.user["id"],),
+        (g.user_id,),
     ).fetchall()
 
-    # render tampilan HTML dasbor membawa daftar berkas pengguna
-    return render_template("dashboard.html", items=items, username=g.user["username"])
+    return render_template("dashboard.html", items=items, username=username)
 
 
 # Rute unggah berkas: diproses sepenuhnya di RAM, dienkripsi ke 3 algoritma (AES, DES, RC4)
 @app.route("/upload", methods=["POST"])
+@auth.login_required
 def upload_file():
-    # verifikasi status autentikasi pengguna
-    if not require_auth():
-        return redirect(url_for("login_stub"))
-
     # cek apakah ada berkas pada request unggahan
     if "file" not in request.files:
-        flash("Tidak ada bagian file dalam request.")
+        flash("No file part in the request.")
         return redirect(url_for("dashboard"))
 
     # var berkas yang diunggah dari form
@@ -160,7 +130,7 @@ def upload_file():
 
     # cek apakah nama file kosong
     if uploaded_file.filename == "":
-        flash("Nama berkas tidak boleh kosong.")
+        flash("File name must not be empty.")
         return redirect(url_for("dashboard"))
 
     # var membaca seluruh bytes isi berkas dari stream BytesIO di RAM
@@ -168,7 +138,7 @@ def upload_file():
 
     # cek jika ukuran file melebihi 0 byte
     if len(plaintext_bytes) == 0:
-        flash("Berkas kosong tidak dapat diunggah.")
+        flash("Empty files cannot be uploaded.")
         return redirect(url_for("dashboard"))
 
     # var menghitung hash SHA-256 berkas asli untuk verifikasi keutuhan (integrity check) saat diunduh
@@ -176,13 +146,8 @@ def upload_file():
 
     # var membuat ID item berkas baru berbasis UUID
     item_id = str(uuid.uuid4())
-    # var mengambil KEK pengguna dari KEK cache memori server (dikembangkan oleh Person 2)
-    kek = session.get("kek_bytes")
-
-    # percabangan fallback KEK jika belum diset dalam sesi
-    if not kek:
-        # var KEK fallback dummy 32 bytes (dipakai untuk testing sebelum auth Person 2 rampung)
-        kek = b"K" * 32
+    # KEK dari KEK cache di memori server (auth.login_required)
+    kek = g.kek
 
     # var daftar algoritma cipher yang wajib digunakan (AES, DES, RC4)
     ciphers = ["aes-gcm", "des-cbc", "rc4"]
@@ -198,7 +163,7 @@ def upload_file():
         "INSERT INTO items (id, user_id, filename_enc, mime_type_enc, sha256_orig) VALUES (?, ?, ?, ?, ?)",
         (
             item_id,
-            g.user["id"],
+            g.user_id,
             uploaded_file.filename.encode("utf-8"),
             uploaded_file.mimetype.encode("utf-8"),
             sha256_orig,
@@ -211,8 +176,8 @@ def upload_file():
         item_secret = new_item_secret()
         
         # var tuple konteks autentikasi metadata (user_id, item_id, cipher_name)
-        # ctx = (g.user["id"], item_id, cipher_name)
-        ctx = (str(g.user["id"]), str(item_id), cipher_name)
+        # ctx = (g.user_id, item_id, cipher_name)
+        ctx = (str(g.user_id), str(item_id), cipher_name)
 
         # 1. Pembungkusan Kunci (Key Wrapping) menggunakan KEK & AES-GCM
         wrapped_key = wrap_secret(kek, item_secret, ctx)
@@ -243,18 +208,15 @@ def upload_file():
     db.commit()
 
     flash(
-        f"Berkas '{uploaded_file.filename}' berhasil dienkripsi dan disimpan dalam 3 algoritma (AES, DES, RC4)!"
+        f"'{uploaded_file.filename}' was encrypted and stored with 3 algorithms (AES, DES, RC4)."
     )
     return redirect(url_for("dashboard"))
 
 
 # Rute unduh & dekripsi berkas: Pengguna memilih algoritma (AES, DES, atau RC4) yang akan didekripsi
 @app.route("/download/<item_id>/<cipher_name>")
+@auth.login_required
 def download_file(item_id, cipher_name):
-    # verifikasi autentikasi pengguna
-    if not require_auth():
-        return redirect(url_for("login_stub"))
-
     # var koneksi database
     db = get_db()
 
@@ -262,14 +224,12 @@ def download_file(item_id, cipher_name):
     # pastikan item yang diminta benar-benar milik pengguna yang sedang terautentikasi
     item = db.execute(
         "SELECT * FROM items WHERE id = ? AND user_id = ?",
-        (item_id, g.user["id"]),
+        (item_id, g.user_id),
     ).fetchone()
 
     # percabangan mengecek keberadaan berkas dan hak akses kepemilikan
     if item is None:
-        flash(
-            "Akses ditolak atau berkas tidak ditemukan (Ownership Check Failed)."
-        )
+        flash("Access denied or file not found.")
         return redirect(url_for("dashboard"))
 
     # ambil metadata salinan berkas berdasarkan cipher yang dipilih
@@ -280,7 +240,7 @@ def download_file(item_id, cipher_name):
 
     # percabangan jika salinan algoritma tidak ditemukan
     if copy_record is None:
-        flash(f"Salinan cipher '{cipher_name}' tidak ditemukan.")
+        flash(f"Copy '{cipher_name}' not found.")
         return redirect(url_for("dashboard"))
 
     # ambil wrapped secret dari basis data
@@ -290,9 +250,9 @@ def download_file(item_id, cipher_name):
     ).fetchone()
 
     # var KEK dari sesi login pengguna
-    kek = session.get("kek_bytes", b"K" * 32)
+    kek = g.kek
     # var tuple konteks autentikasi data
-    ctx = (g.user["id"], item_id, cipher_name)
+    ctx = (g.user_id, item_id, cipher_name)
 
     try:
         # 1. Opens & Unwraps Item Secret dengan KEK
@@ -314,7 +274,7 @@ def download_file(item_id, cipher_name):
             )
 
     except Exception as err:
-        flash(f"Gagal mendekripsi atau memverifikasi berkas: {str(err)}")
+        flash(f"Could not decrypt or verify the file: {err}")
         return redirect(url_for("dashboard"))
 
     # var mengembalikan data file terdekripsi langsung ke browser pengguna dari RAM
@@ -327,11 +287,8 @@ def download_file(item_id, cipher_name):
 
 # Rute hapus berkas: Menghapus entri SQLite dan berkas blob fisik secara permanen
 @app.route("/delete/<item_id>", methods=["POST"])
+@auth.login_required
 def delete_file(item_id):
-    # verifikasi autentikasi pengguna
-    if not require_auth():
-        return redirect(url_for("login_stub"))
-
     # var koneksi database
     db = get_db()
 
@@ -339,11 +296,11 @@ def delete_file(item_id):
     # pastikan item yang akan dihapus milik pengguna yang sedang terautentikasi
     item = db.execute(
         "SELECT * FROM items WHERE id = ? AND user_id = ?",
-        (item_id, g.user["id"]),
+        (item_id, g.user_id),
     ).fetchone()
 
     if item is None:
-        flash("Gagal menghapus: Berkas tidak ditemukan atau akses ditolak.")
+        flash("Delete failed: file not found or access denied.")
         return redirect(url_for("dashboard"))
 
     # ambil seluruh jalur file blob fisik yang terkait dengan item ini
@@ -359,42 +316,13 @@ def delete_file(item_id):
     db.execute("DELETE FROM items WHERE id = ?", (item_id,))
     db.commit()
 
-    flash("Berkas beserta seluruh 3 salinan terenkripsinya berhasil dihapus.")
-    return redirect(url_for("dashboard"))
-
-
-# Rute login stub sederhana (untuk kebutuhan pengujian sebelum auth Person 2 diintegrasikan)
-@app.route("/login-stub")
-def login_stub():
-    db = get_db()
-    user = db.execute("SELECT * FROM users LIMIT 1").fetchone()
-
-    # percabangan jika belum ada user di database, buat user dummy
-    if not user:
-        user_id = str(uuid.uuid4())
-        db.execute(
-            "INSERT INTO users (id, username, login_key, salt, access_until) VALUES (?, ?, ?, ?, ?)",
-            (
-                user_id,
-                "mahasiswa_demo",
-                b"login_key_bytes",
-                b"salt_bytes",
-                "2026-12-31",
-            ),
-        )
-        db.commit()
-        user_id_logged = user_id
-    else:
-        user_id_logged = user["id"]
-
-    # simpan ID pengguna dan dummy KEK ke dalam sesi login Flask
-    session["user_id"] = user_id_logged
-    session["kek_bytes"] = b"K" * 32
-    flash("Login berhasil (Mode Demo Stub).")
+    flash("The file and all 3 of its encrypted copies were deleted.")
     return redirect(url_for("dashboard"))
 
 
 # eksekusi server web Flask
 if __name__ == "__main__":
-    init_db()
+    # flag Secure membuat browser tidak mengirim cookie lewat http://localhost;
+    # matikan hanya untuk server pengembangan lokal
+    app.config["SESSION_COOKIE_SECURE"] = False
     app.run(debug=True, port=5001)

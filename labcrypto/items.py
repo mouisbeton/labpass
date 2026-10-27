@@ -11,6 +11,7 @@ from Crypto.Cipher import ARC4
 from Crypto.Cipher import DES
 from Crypto.Hash import SHA256
 from Crypto.Protocol.KDF import HKDF
+from Crypto.Util.Padding import pad, unpad
 
 from .keys import (
     GCM_TAG_LENGTH,
@@ -90,39 +91,14 @@ def _aes_cbc_keys(
 
 
 def _rc4_crypt(key: bytes, data: bytes) -> bytes:
-    cipher = ARC4.new(key)
-    cipher.encrypt(b"\x00" * _RC4_DROP_LENGTH)
-    return cipher.encrypt(data)
+    return ARC4.new(key, drop=_RC4_DROP_LENGTH).encrypt(data)
 
 
-def _pkcs7_pad(data: bytes) -> bytes:
-    padding = _DES_BLOCK_SIZE - (len(data) % _DES_BLOCK_SIZE)
-    return data + bytes([padding]) * padding
-
-
-def _pkcs7_unpad(data: bytes) -> bytes:
-    if not data or len(data) % _DES_BLOCK_SIZE:
-        raise IntegrityError("invalid DES padding")
-    padding = data[-1]
-    if padding < 1 or padding > _DES_BLOCK_SIZE or data[-padding:] != bytes([padding]) * padding:
-        raise IntegrityError("invalid DES padding")
-    return data[:-padding]
-
-
-def _pkcs7_pad_aes(data: bytes) -> bytes:
-    padding = _AES_BLOCK_SIZE - (len(data) % _AES_BLOCK_SIZE)
-    return data + bytes([padding]) * padding
-
-
-def _pkcs7_unpad_aes(data: bytes) -> bytes:
-    if not data or len(data) % _AES_BLOCK_SIZE:
-        raise IntegrityError("invalid AES padding")
-    padding = data[-1]
-    if padding < 1 or padding > _AES_BLOCK_SIZE:
-        raise IntegrityError("invalid AES padding")
-    if data[-padding:] != bytes([padding]) * padding:
-        raise IntegrityError("invalid AES padding")
-    return data[:-padding]
+def _unpad(data: bytes, block_size: int) -> bytes:
+    try:
+        return unpad(data, block_size)
+    except ValueError as exc:
+        raise IntegrityError("invalid padding") from exc
 
 
 def encrypt_item(
@@ -163,14 +139,14 @@ def encrypt_item(
             iv = secrets.token_bytes(_AES_IV_LENGTH)
             body = iv + AES.new(
                 aes_key, AES.MODE_CBC, iv
-            ).encrypt(_pkcs7_pad_aes(bytes(chunk)))
+            ).encrypt(pad(bytes(chunk), _AES_BLOCK_SIZE))
             header = struct.pack(_HEADER_FORMAT, index, int(last), len(body))
             aad = context + header
             tag = hmac.new(mac_key, aad + body, hashlib.sha256).digest()
         elif cipher_name == "des-cbc":
             des_key, mac_key = _des_keys(item_secret, ctx, salt, index)
             iv = secrets.token_bytes(_DES_IV_LENGTH)
-            body = iv + DES.new(des_key, DES.MODE_CBC, iv).encrypt(_pkcs7_pad(bytes(chunk)))
+            body = iv + DES.new(des_key, DES.MODE_CBC, iv).encrypt(pad(bytes(chunk), _DES_BLOCK_SIZE))
             header = struct.pack(_HEADER_FORMAT, index, int(last), len(body))
             aad = context + header
             tag = hmac.new(mac_key, aad + body, hashlib.sha256).digest()
@@ -255,7 +231,7 @@ def decrypt_item(
             decrypted = AES.new(
                 aes_key, AES.MODE_CBC, iv
             ).decrypt(body[_AES_IV_LENGTH:])
-            plaintext.extend(_pkcs7_unpad_aes(decrypted))
+            plaintext.extend(_unpad(decrypted, _AES_BLOCK_SIZE))
         elif cipher_name == "des-cbc":
             if len(body) < _DES_IV_LENGTH + _DES_BLOCK_SIZE or (len(body) - _DES_IV_LENGTH) % _DES_BLOCK_SIZE:
                 raise IntegrityError("invalid DES body length")
@@ -269,7 +245,7 @@ def decrypt_item(
                 raise IntegrityError("chunk failed authentication")
             iv = body[:_DES_IV_LENGTH]
             decrypted = DES.new(des_key, DES.MODE_CBC, iv).decrypt(body[_DES_IV_LENGTH:])
-            plaintext.extend(_pkcs7_unpad(decrypted))
+            plaintext.extend(_unpad(decrypted, _DES_BLOCK_SIZE))
         else:
             rc4_key, mac_key = _rc4_keys(item_secret, ctx, salt, index)
             expected_tag = hmac.new(mac_key, context + header + body, hashlib.sha256).digest()

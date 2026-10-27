@@ -13,13 +13,15 @@ import re
 import sqlite3
 import uuid
 from datetime import date, datetime, timezone
+from functools import wraps
 
-from flask import Blueprint, flash, redirect, render_template, request, session, url_for
+from flask import Blueprint, flash, g, redirect, render_template, request, session, url_for
 from flask_wtf import CSRFProtect
 
 import database
 import session_cache
-from labcrypto import derive_keys, new_salt
+from labcrypto import IntegrityError, derive_keys, new_salt, unwrap_secret, wrap_secret
+from storage import delete_blob_file
 
 bp = Blueprint("auth", __name__)
 csrf = CSRFProtect()
@@ -259,4 +261,174 @@ def logout():
     session.clear()
 
     flash("You have been logged out.")
+    return redirect(url_for("auth.login"))
+
+
+# Protected routes
+
+
+# Look up the cache entry behind this request's cookie; return (user_id, kek) or None
+def _current_session():
+    sid = session.get("sid")
+    if not sid:
+        return None
+
+    entry = session_cache.get(sid)
+    if entry is None:
+        # Expired or unknown ID (for example after a server restart): drop it from the cookie
+        session.pop("sid", None)
+    return entry
+
+
+# Return the KEK of the logged-in student, or None if there is no valid session
+def get_kek():
+    entry = _current_session()
+    return entry[1] if entry else None
+
+
+# Decorator for routes that need a logged-in student; sets g.user_id and g.kek for the route
+def login_required(view):
+    # wraps keeps the route's own name, so Flask does not see every protected route as "wrapped"
+    @wraps(view)
+    def wrapped_view(*args, **kwargs):
+        entry = _current_session()
+        if entry is None:
+            flash("Please log in first.")
+            return redirect(url_for("auth.login"))
+
+        g.user_id, g.kek = entry
+        return view(*args, **kwargs)
+
+    return wrapped_view
+
+
+# Change password
+
+
+# Check a password against the stored login_key of one user; return the KEK if it matches
+def _verify_password(db, user_id, password):
+    user = db.execute(
+        "SELECT salt, login_key FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if user is None:
+        return None
+
+    login_key, kek = derive_keys(password, user["salt"])
+    if not hmac.compare_digest(login_key, user["login_key"]):
+        return None
+    return kek
+
+
+@bp.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "GET":
+        return render_template("change_password.html", errors=[])
+
+    old_password = request.form.get("old_password", "")
+    new_password = request.form.get("new_password", "")
+    new_password_confirm = request.form.get("new_password_confirm", "")
+
+    db = database.get_db()
+    old_kek = _verify_password(db, g.user_id, old_password)
+    if old_kek is None:
+        return render_template(
+            "change_password.html", errors=["Current password is wrong."]
+        ), 401
+
+    errors = []
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        errors.append(f"New password must be at least {MIN_PASSWORD_LENGTH} characters long.")
+    if new_password != new_password_confirm:
+        errors.append("New password confirmation does not match.")
+    if errors:
+        return render_template("change_password.html", errors=errors), 400
+
+    new_salt_value = new_salt()
+    new_login_key, new_kek = derive_keys(new_password, new_salt_value)
+
+    try:
+        # One transaction: every item key is re-wrapped and the new password stored, or nothing is.
+        # The files themselves are not re-encrypted; only the small wrapped secrets change.
+        with db:
+            # Read the keys inside the transaction so none can be missed between read and update
+            wrapped_rows = db.execute(
+                "SELECT w.item_id, w.cipher, w.wrapped_secret FROM wrapped_keys w "
+                "JOIN items i ON i.id = w.item_id WHERE i.user_id = ?",
+                (g.user_id,),
+            ).fetchall()
+            for row in wrapped_rows:
+                ctx = (g.user_id, row["item_id"], row["cipher"])
+                item_secret = unwrap_secret(old_kek, row["wrapped_secret"], ctx)
+                db.execute(
+                    "UPDATE wrapped_keys SET wrapped_secret = ? WHERE item_id = ? AND cipher = ?",
+                    (wrap_secret(new_kek, item_secret, ctx), row["item_id"], row["cipher"]),
+                )
+            db.execute(
+                "UPDATE users SET salt = ?, login_key = ? WHERE id = ?",
+                (new_salt_value, new_login_key, g.user_id),
+            )
+    except IntegrityError:
+        # A wrapped key did not open with the old KEK (tampered data); nothing was changed
+        return render_template(
+            "change_password.html",
+            errors=["Your stored keys could not be verified. The password was not changed."],
+        ), 500
+
+    # The old KEK is useless now: end every session of this student, then start a fresh one
+    session_cache.delete_user(g.user_id)
+    session.clear()
+    session["sid"] = session_cache.create(g.user_id, new_kek)
+
+    flash("Password changed.")
+    return redirect(url_for("dashboard"))
+
+
+# Withdraw consent
+
+
+# Delete every database row of one student in one transaction and return their blob file paths.
+# Rows are deleted child-first on purpose: SQLite foreign keys (ON DELETE CASCADE) are off by default.
+def delete_user_data(db, user_id):
+    item_ids = "SELECT id FROM items WHERE user_id = ?"
+    with db:
+        blob_paths = [
+            row["blob_path"]
+            for row in db.execute(
+                f"SELECT blob_path FROM copies WHERE item_id IN ({item_ids})", (user_id,)
+            )
+        ]
+        db.execute(f"DELETE FROM wrapped_keys WHERE item_id IN ({item_ids})", (user_id,))
+        db.execute(f"DELETE FROM copies WHERE item_id IN ({item_ids})", (user_id,))
+        db.execute("DELETE FROM items WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM consents WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return blob_paths
+
+
+@bp.route("/withdraw-consent", methods=["GET", "POST"])
+@login_required
+def withdraw_consent():
+    if request.method == "GET":
+        return render_template("withdraw_consent.html", errors=[])
+
+    db = database.get_db()
+    # Deleting everything cannot be undone, so ask for the password again
+    # (protects against someone using a student's unlocked computer)
+    if _verify_password(db, g.user_id, request.form.get("password", "")) is None:
+        return render_template(
+            "withdraw_consent.html", errors=["Password is wrong. Nothing was deleted."]
+        ), 401
+
+    blob_paths = delete_user_data(db, g.user_id)
+
+    # The wrapped keys are already gone, so the blobs can never be decrypted again
+    # (crypto-shredding); deleting the files as well frees the disk
+    for path in blob_paths:
+        delete_blob_file(path)
+
+    session_cache.delete_user(g.user_id)
+    session.clear()
+
+    flash("Your consent was withdrawn and all your data has been deleted.")
     return redirect(url_for("auth.login"))

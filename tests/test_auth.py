@@ -168,4 +168,4 @@ def test_post_with_csrf_token_is_accepted(tmp_path, monkeypatch):
     token = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
     response = client.post("/register", data={**VALID_FORM, "csrf_token": token})
     assert response.status_code == 302
-    assert len(_rows("SELECT * FROM users")) == 
+    assert len(_rows("SELECT * FROM users")) == 1

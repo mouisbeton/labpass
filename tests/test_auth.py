@@ -169,3 +169,39 @@ def test_post_with_csrf_token_is_accepted(tmp_path, monkeypatch):
     response = client.post("/register", data={**VALID_FORM, "csrf_token": token})
     assert response.status_code == 302
     assert len(_rows("SELECT * FROM users")) == 1
+
+
+# Check login 
+
+
+def test_check_login_accepts_correct_password(client):
+    client.post("/register", data=VALID_FORM)
+    with client.application.app_context():
+        result = auth.check_login("kucing.oren", VALID_FORM["password"])
+
+    user = _rows("SELECT id, salt FROM users")[0]
+    _, expected_kek = derive_keys(VALID_FORM["password"], user["salt"])
+    assert result == (user["id"], expected_kek)
+
+def test_check_login_ignores_username_case_and_spaces(client):
+    client.post("/register", data=VALID_FORM)
+    with client.application.app_context():
+        assert auth.check_login("  KUCING.Oren ", VALID_FORM["password"]) is not None
+
+def test_check_login_rejects_wrong_password(client):
+    client.post("/register", data=VALID_FORM)
+    with client.application.app_context():
+        assert auth.check_login("kucing.oren", "password-yang-salah") is None
+
+def test_check_login_unknown_username_still_runs_argon2(client, monkeypatch):
+    calls = []
+    real_derive_keys = auth.derive_keys
+
+    def counting_derive_keys(password, salt):
+        calls.append(salt)
+        return real_derive_keys(password, salt)
+
+    monkeypatch.setattr(auth, "derive_keys", counting_derive_keys)
+    with client.application.app_context():
+        assert auth.check_login("tidak.ada", VALID_FORM["password"]) is None
+    assert len(calls) == 1

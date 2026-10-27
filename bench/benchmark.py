@@ -6,9 +6,11 @@ Run from the repo root:
     python -m bench.benchmark --backend stub
 
 Backends:
-    real  - labcrypto.encrypt_item / decrypt_item (person 1's module, same code as the app)
-    stub  - bench/stub_cipher.py, a temporary stand-in; results go to results/raw/stub/ only
-    auto  - real if labcrypto has encrypt_item, otherwise stub (default)
+    real  - labcrypto.encrypt_item / decrypt_item (person 1's module, same code as the app);
+            stops if any cipher is not implemented there yet
+    stub  - bench/stub_cipher.py, a temporary stand-in for every cipher
+    auto  - per cipher: real if labcrypto supports it, otherwise stub (default)
+Only an all-real full run writes to results/; anything else goes to results/raw/ (gitignored).
 
 What it measures:
     1. encrypt / decrypt speed per cipher per size
@@ -55,16 +57,51 @@ def size_label(n: int) -> str:
 
 
 def load_backend(name: str):
+    """Pick real or stub code per cipher.
+
+    Person 1 adds ciphers one at a time, so in auto mode each cipher uses the
+    real labcrypto code if it already supports that cipher, else the stub.
+    Returns (overall, {cipher: source}, enc, dec) where overall is
+    "real" only if every cipher is real.
+    """
+    from bench import stub_cipher
+
+    real_enc = real_dec = None
     if name in ("real", "auto"):
         try:
-            from labcrypto import decrypt_item, encrypt_item
-            return "real", encrypt_item, decrypt_item
+            from labcrypto import decrypt_item as real_dec, encrypt_item as real_enc
         except ImportError:
-            if name == "real":
-                sys.exit("labcrypto has no encrypt_item/decrypt_item yet. Use --backend stub.")
-    from bench.stub_cipher import decrypt_item, encrypt_item
-    print("!! Using STUB cipher backend: numbers are for testing the harness only, not the report.\n")
-    return "stub", encrypt_item, decrypt_item
+            pass
+
+    sources = {}
+    for c in BENCH_CIPHERS:
+        sources[c] = "stub"
+        if real_enc is None:
+            continue
+        try:  # probe: does the real module support this cipher yet?
+            secret = new_item_secret()
+            ctx = ("probe-user", "probe-item", c)
+            if real_dec(c, real_enc(c, b"probe", secret, ctx), secret, ctx) == b"probe":
+                sources[c] = "real"
+        except (ValueError, NotImplementedError):
+            pass
+
+    if name == "real" and "stub" in sources.values():
+        missing = [c for c, s in sources.items() if s == "stub"]
+        sys.exit(f"labcrypto does not support {missing} yet. Use --backend auto or stub.")
+
+    def enc(c, *args):
+        return (real_enc if sources[c] == "real" else stub_cipher.encrypt_item)(c, *args)
+
+    def dec(c, *args):
+        return (real_dec if sources[c] == "real" else stub_cipher.decrypt_item)(c, *args)
+
+    values = set(sources.values())
+    overall = "real" if values == {"real"} else "stub" if values == {"stub"} else "mixed"
+    print("Cipher code:", ", ".join(f"{c}={s}" for c, s in sources.items()))
+    if overall != "real":
+        print("!! Some ciphers use the STUB: numbers are for testing the harness only, not the report.\n")
+    return overall, sources, enc, dec
 
 
 def summarize(times: list[float]) -> dict:
@@ -241,10 +278,11 @@ def main() -> None:
     p.add_argument("--skip", nargs="*", default=[], choices=("keys", "ciphers", "upload"))
     args = p.parse_args()
 
-    backend, enc, dec = load_backend(args.backend)
+    backend, sources, enc, dec = load_backend(args.backend)
     sizes = QUICK_SIZES if args.quick else FULL_SIZES
     runs = args.runs or (3 if args.quick else 10)
     info = machine_info(backend)
+    info["cipher_code"] = sources
     info.update(sizes=[size_label(s) for s in sizes], runs=runs, warmup=args.warmup, quick=args.quick)
     print(json.dumps(info, indent=2), "\n")
 

@@ -8,6 +8,7 @@
 # - ./templates/register.html: registration form
 # - ./app.py: only needs to call auth.init_app(app)
 
+import hmac
 import re
 import sqlite3
 import uuid
@@ -84,6 +85,32 @@ def validate_username(username):
         return "Username must not contain an NRP."
 
     return None
+
+
+# Check a username and password for login.
+# Returns (user_id, kek) on success, or None on any failure; callers must not reveal which check failed.
+def check_login(username, password):
+    # Normalise the same way as registration, so "Budi" finds "budi"
+    username = username.strip().lower()
+
+    db = database.get_db()
+    user = db.execute(
+        "SELECT id, salt, login_key FROM users WHERE username = ?", (username,)
+    ).fetchone()
+
+    if user is None:
+        # Still run Argon2id so an unknown username takes as long as a wrong password
+        derive_keys(password, bytes(16))
+        return None
+
+    # Recompute both keys from the typed password; the KEK is never read from the database
+    login_key, kek = derive_keys(password, user["salt"])
+
+    # Constant-time comparison so response timing does not leak how many bytes matched
+    if not hmac.compare_digest(login_key, user["login_key"]):
+        return None
+
+    return user["id"], kek
 
 
 # Calculate the end date of the current semester as the access_until limit

@@ -76,6 +76,10 @@ def run_daily_cleanup():
                     if deleted:
                         print(f"  -> File blob dihapus: {blob_path}")
 
+            # hapus record terenkripsi (metadata berkas & data pribadi) milik pengguna;
+            # foreign key SQLite tidak aktif, jadi CASCADE tidak berjalan
+            cursor.execute("DELETE FROM records WHERE user_id = ?", (user_id,))
+
             # 2. Hapus data pengguna dari tabel users (FK ON DELETE CASCADE akan menghapus items, copies, & wrapped_keys)
             cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
             print(

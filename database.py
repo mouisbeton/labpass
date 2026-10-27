@@ -89,6 +89,20 @@ def init_db():
     );
     """)
 
+    # eksekusi query pembuatan tabel records (record kecil terenkripsi: metadata berkas & data pribadi) jika belum ada
+    # record_id = "<item_id>/meta" untuk nama & mime type berkas, "profile" untuk data pribadi
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS records (
+        user_id TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        cipher TEXT NOT NULL,
+        blob BLOB NOT NULL,
+        wrapped_secret BLOB NOT NULL,
+        PRIMARY KEY (user_id, record_id, cipher),
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    """)
+
     # simpan perubahan skema ke file database fisik
     conn.commit()
     # tutup koneksi database inisialisasi

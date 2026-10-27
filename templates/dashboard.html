@@ -37,6 +37,7 @@ Related Files:
     <div class="container">
         <!-- Account links (auth.py) -->
         <div class="topbar">
+            <a href="{{ url_for('profile') }}">My personal data</a>
             <a href="{{ url_for('auth.change_password') }}">Change password</a>
             <a href="{{ url_for('auth.withdraw_consent') }}" class="danger-link">Withdraw consent</a>
             <!-- Logout is POST-only, so it is a small form rather than a link -->

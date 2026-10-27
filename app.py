@@ -5,9 +5,11 @@
 # - ./storage.py: Untuk menyimpan dan membaca berkas blob ciphertext pada disk
 # - ./crypto_stub.py (atau labcrypto): Modul kriptografi untuk enkripsi/dekripsi dan key wrapping
 # - ./templates/dashboard.html: Tampilan UI antarmuka utama pengguna
+# - ./templates/profile.html: Form data pribadi (nama, NRP, telepon, email)
 
 import hashlib
 import io
+import json
 import os
 import uuid
 from flask import (
@@ -93,6 +95,58 @@ app.secret_key = os.urandom(24)
 auth.init_app(app)
 
 # ==============================================================================
+# RECORD TERENKRIPSI (metadata berkas & data pribadi)
+# ==============================================================================
+# var daftar algoritma cipher untuk setiap record (sama dengan salinan berkas)
+RECORD_CIPHERS = ["aes-gcm", "des-cbc", "rc4"]
+
+
+# fungsi menyimpan satu record kecil (bytes) terenkripsi dengan 3 algoritma ke tabel records
+# Catatan: commit dilakukan oleh pemanggil
+def save_record(db, user_id, kek, record_id, plaintext):
+    # hapus versi lama record agar tidak ada sisa salinan lama
+    db.execute(
+        "DELETE FROM records WHERE user_id = ? AND record_id = ?",
+        (user_id, record_id),
+    )
+
+    # loop enkripsi record ke dalam 3 algoritma independen
+    for cipher_name in RECORD_CIPHERS:
+        # var item secret BARU untuk setiap penulisan (nonce AES-GCM = penghitung chunk)
+        item_secret = new_item_secret()
+        # var tuple konteks autentikasi (user_id, record_id, cipher_name)
+        ctx = (str(user_id), record_id, cipher_name)
+
+        db.execute(
+            "INSERT INTO records (user_id, record_id, cipher, blob, wrapped_secret) VALUES (?, ?, ?, ?, ?)",
+            (
+                user_id,
+                record_id,
+                cipher_name,
+                encrypt_item(cipher_name, plaintext, item_secret, ctx),
+                wrap_secret(kek, item_secret, ctx),
+            ),
+        )
+
+
+# fungsi membaca dan mendekripsi satu salinan record; mengembalikan None jika record tidak ada
+def load_record(db, user_id, kek, record_id, cipher_name):
+    row = db.execute(
+        "SELECT blob, wrapped_secret FROM records WHERE user_id = ? AND record_id = ? AND cipher = ?",
+        (user_id, record_id, cipher_name),
+    ).fetchone()
+
+    # percabangan jika record belum pernah disimpan
+    if row is None:
+        return None
+
+    # var tuple konteks autentikasi (user_id, record_id, cipher_name)
+    ctx = (str(user_id), record_id, cipher_name)
+    item_secret = unwrap_secret(kek, row["wrapped_secret"], ctx)
+    return decrypt_item(cipher_name, row["blob"], item_secret, ctx)
+
+
+# ==============================================================================
 # FLASK ROUTES
 # ==============================================================================
 
@@ -158,17 +212,24 @@ def upload_file():
     # item_secret = new_item_secret()
 
     # simpan metadata dasar item ke basis data SQLite
-    # Catatan: Nama berkas dan mime type dienkripsi atau disimpan secara pseudonim
+    # Catatan: kolom filename_enc & mime_type_enc dikosongkan; nama berkas dan mime type
+    # disimpan terenkripsi di tabel records (record_id "<item_id>/meta")
     db.execute(
         "INSERT INTO items (id, user_id, filename_enc, mime_type_enc, sha256_orig) VALUES (?, ?, ?, ?, ?)",
         (
             item_id,
             g.user_id,
-            uploaded_file.filename.encode("utf-8"),
-            uploaded_file.mimetype.encode("utf-8"),
+            b"",
+            b"",
             sha256_orig,
         ),
     )
+
+    # var metadata berkas dalam bentuk JSON
+    meta = {"filename": uploaded_file.filename, "mime_type": uploaded_file.mimetype}
+    # simpan metadata terenkripsi dengan record_id berbeda dari item_id,
+    # agar blob metadata tidak bisa ditukar dengan blob berkas
+    save_record(db, g.user_id, kek, f"{item_id}/meta", json.dumps(meta).encode("utf-8"))
 
     # loop melakukan enkripsi berkas ke dalam 3 algoritma independen
     for cipher_name in ciphers:
@@ -273,6 +334,17 @@ def download_file(item_id, cipher_name):
                 "Integritas data rusak: SHA-256 tidak cocok dengan berkas asli!"
             )
 
+        # 5. Dekripsi metadata (nama berkas & mime type) dengan cipher yang SAMA
+        meta_bytes = load_record(db, g.user_id, kek, f"{item_id}/meta", cipher_name)
+        if meta_bytes is not None:
+            meta = json.loads(meta_bytes)
+        else:
+            # berkas lama (diunggah sebelum metadata dienkripsi): baca kolom lama
+            meta = {
+                "filename": item["filename_enc"].decode("utf-8"),
+                "mime_type": item["mime_type_enc"].decode("utf-8"),
+            }
+
     except Exception as err:
         flash(f"Could not decrypt or verify the file: {err}")
         return redirect(url_for("dashboard"))
@@ -280,7 +352,8 @@ def download_file(item_id, cipher_name):
     # var mengembalikan data file terdekripsi langsung ke browser pengguna dari RAM
     return send_file(
         io.BytesIO(plaintext_bytes),
-        download_name=item["filename_enc"].decode("utf-8"),
+        download_name=meta["filename"],
+        mimetype=meta["mime_type"],
         as_attachment=True,
     )
 
@@ -314,9 +387,51 @@ def delete_file(item_id):
 
     # hapus metadata item dari SQLite (ON DELETE CASCADE akan membersihkan tabel copies & wrapped_keys)
     db.execute("DELETE FROM items WHERE id = ?", (item_id,))
+    # hapus metadata terenkripsi berkas (tabel records tidak terhubung ke items)
+    db.execute(
+        "DELETE FROM records WHERE user_id = ? AND record_id = ?",
+        (g.user_id, f"{item_id}/meta"),
+    )
     db.commit()
 
     flash("The file and all 3 of its encrypted copies were deleted.")
+    return redirect(url_for("dashboard"))
+
+
+# var nama field data pribadi yang wajib diisi
+PROFILE_FIELDS = ["name", "nrp", "phone", "email"]
+
+
+# Rute data pribadi: nama, NRP, telepon, email disimpan sebagai satu record JSON per cipher
+@app.route("/profile", methods=["GET", "POST"])
+@auth.login_required
+def profile():
+    # var koneksi database
+    db = get_db()
+
+    if request.method == "GET":
+        # var data pribadi dari salinan AES-GCM (None jika belum pernah disimpan)
+        profile_bytes = load_record(db, g.user_id, g.kek, "profile", "aes-gcm")
+        data = json.loads(profile_bytes) if profile_bytes else {}
+        return render_template("profile.html", errors=[], data=data)
+
+    # var data form yang dikirim pengguna
+    data = {field: request.form.get(field, "").strip() for field in PROFILE_FIELDS}
+
+    # validasi: semua field wajib diisi dan NRP harus 10 digit
+    errors = []
+    if not all(data.values()):
+        errors.append("All fields are required.")
+    if data["nrp"] and not auth.NRP_PATTERN.fullmatch(data["nrp"]):
+        errors.append("NRP must be exactly 10 digits.")
+    if errors:
+        return render_template("profile.html", errors=errors, data=data), 400
+
+    # simpan data pribadi terenkripsi (item secret baru untuk setiap cipher)
+    save_record(db, g.user_id, g.kek, "profile", json.dumps(data).encode("utf-8"))
+    db.commit()
+
+    flash("Your personal data was encrypted and saved.")
     return redirect(url_for("dashboard"))
 
 

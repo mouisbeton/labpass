@@ -364,6 +364,19 @@ def change_password():
                     "UPDATE wrapped_keys SET wrapped_secret = ? WHERE item_id = ? AND cipher = ?",
                     (wrap_secret(new_kek, item_secret, ctx), row["item_id"], row["cipher"]),
                 )
+            # Same for the small encrypted records (file metadata and personal data)
+            record_rows = db.execute(
+                "SELECT record_id, cipher, wrapped_secret FROM records WHERE user_id = ?",
+                (g.user_id,),
+            ).fetchall()
+            for row in record_rows:
+                ctx = (g.user_id, row["record_id"], row["cipher"])
+                item_secret = unwrap_secret(old_kek, row["wrapped_secret"], ctx)
+                db.execute(
+                    "UPDATE records SET wrapped_secret = ? "
+                    "WHERE user_id = ? AND record_id = ? AND cipher = ?",
+                    (wrap_secret(new_kek, item_secret, ctx), g.user_id, row["record_id"], row["cipher"]),
+                )
             db.execute(
                 "UPDATE users SET salt = ?, login_key = ? WHERE id = ?",
                 (new_salt_value, new_login_key, g.user_id),
@@ -401,6 +414,7 @@ def delete_user_data(db, user_id):
         db.execute(f"DELETE FROM wrapped_keys WHERE item_id IN ({item_ids})", (user_id,))
         db.execute(f"DELETE FROM copies WHERE item_id IN ({item_ids})", (user_id,))
         db.execute("DELETE FROM items WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM records WHERE user_id = ?", (user_id,))
         db.execute("DELETE FROM consents WHERE user_id = ?", (user_id,))
         db.execute("DELETE FROM users WHERE id = ?", (user_id,))
     return blob_paths

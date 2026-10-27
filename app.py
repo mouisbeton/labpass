@@ -190,7 +190,7 @@ def upload_file():
     db = get_db()
 
     # var kunci rahasia item baru yang segar (fresh secret) untuk item ini
-    item_secret = new_item_secret()
+    # item_secret = new_item_secret()
 
     # simpan metadata dasar item ke basis data SQLite
     # Catatan: Nama berkas dan mime type dienkripsi atau disimpan secara pseudonim
@@ -207,8 +207,12 @@ def upload_file():
 
     # loop melakukan enkripsi berkas ke dalam 3 algoritma independen
     for cipher_name in ciphers:
+
+        item_secret = new_item_secret()
+        
         # var tuple konteks autentikasi metadata (user_id, item_id, cipher_name)
-        ctx = (g.user["id"], item_id, cipher_name)
+        # ctx = (g.user["id"], item_id, cipher_name)
+        ctx = (str(g.user["id"]), str(item_id), cipher_name)
 
         # 1. Pembungkusan Kunci (Key Wrapping) menggunakan KEK & AES-GCM
         wrapped_key = wrap_secret(kek, item_secret, ctx)

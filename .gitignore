@@ -1,5 +1,6 @@
 # Runtime data (database, secret key) - never commit
 data/
+*.db
 
 # Raw benchmark dumps (commit only summarised CSVs/charts)
 bench/results/raw/

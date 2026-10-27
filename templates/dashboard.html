@@ -1,11 +1,12 @@
 <!--
 @kode-komentar-id
-Fungsi File: Antarmuka UI dasbor pengguna untuk mengunggah berkas di RAM, melihat daftar dokumen terenkripsi, memilih algoritma dekripsi (AES, DES, RC4), dan memverifikasi nilai hash SHA-256.
-File Terhubung:
-- ../app.py: Menerima request POST /upload, GET /download/<item_id>/<cipher>, dan POST /delete/<item_id>
+File Purpose: User dashboard for uploading files (processed in RAM), listing encrypted documents, choosing which copy to decrypt (AES, DES, RC4), and checking the SHA-256 hash.
+Related Files:
+- ../app.py: handles POST /upload, GET /download/<item_id>/<cipher>, and POST /delete/<item_id>
+- ../auth.py: account links (change password, withdraw consent, log out)
 -->
 <!DOCTYPE html>
-<html lang="id">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -14,6 +15,11 @@ File Terhubung:
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; }
         .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         h1, h2 { color: #1e293b; }
+        .topbar { display: flex; justify-content: flex-end; align-items: center; gap: 12px; font-size: 14px; margin-bottom: 10px; }
+        .topbar a { color: #2563eb; text-decoration: none; }
+        .topbar a.danger-link { color: #dc2626; }
+        .topbar form { display: inline; margin: 0; }
+        .link-button { background: none; border: none; color: #2563eb; cursor: pointer; font: inherit; padding: 0; }
         .flash-messages { background: #e0f2fe; border-left: 4px solid #0284c7; padding: 10px 15px; margin-bottom: 20px; border-radius: 4px; color: #0369a1; }
         .upload-card { background: #f8fafc; border: 2px dashed #cbd5e1; padding: 20px; border-radius: 6px; text-align: center; margin-bottom: 30px; }
         .upload-card input[type="file"] { margin-bottom: 12px; }
@@ -29,10 +35,21 @@ File Terhubung:
 </head>
 <body>
     <div class="container">
-        <h1>Portal Pendaftaran Akses Laboratorium</h1>
-        <p>Selamat datang, <strong>{{ username }}</strong>! Seluruh berkas disimpan terenkripsi ke 3 algoritma (AES-256-GCM, DES-CBC, RC4).</p>
+        <!-- Account links (auth.py) -->
+        <div class="topbar">
+            <a href="{{ url_for('auth.change_password') }}">Change password</a>
+            <a href="{{ url_for('auth.withdraw_consent') }}" class="danger-link">Withdraw consent</a>
+            <!-- Logout is POST-only, so it is a small form rather than a link -->
+            <form method="POST" action="{{ url_for('auth.logout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="link-button">Log out</button>
+            </form>
+        </div>
 
-        <!-- Tampilkan pesan Flash Notifikasi -->
+        <h1>Lab Access Enrollment Portal</h1>
+        <p>Welcome, <strong>{{ username }}</strong>! Every file is stored encrypted with 3 algorithms (AES-256-GCM, DES-CBC, RC4).</p>
+
+        <!-- Flash messages -->
         {% with messages = get_flashed_messages() %}
             {% if messages %}
                 <div class="flash-messages">
@@ -43,26 +60,27 @@ File Terhubung:
             {% endif %}
         {% endwith %}
 
-        <!-- Form Unggah Berkas ke RAM -->
+        <!-- Upload form (processed in RAM) -->
         <div class="upload-card">
-            <h2>Unggah Dokumen / Video Biometrik</h2>
-            <form action="/upload" method="POST" enctype="multipart/form-data">
+            <h2>Upload a Document or Biometric Video</h2>
+            <form action="{{ url_for('upload_file') }}" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="file" name="file" required><br>
-                <button type="submit" class="btn btn-primary">Enkripsi & Simpan Ke Portal</button>
+                <button type="submit" class="btn btn-primary">Encrypt &amp; Save to Portal</button>
             </form>
         </div>
 
-        <!-- Tabel Daftar Berkas Terenkripsi -->
-        <h2>Daftar Berkas Terenkripsi Saya</h2>
+        <!-- List of encrypted files -->
+        <h2>My Encrypted Files</h2>
         {% if items %}
             <table>
                 <thead>
                     <tr>
-                        <th>ID Berkas</th>
-                        <th>Verifikasi Keutuhan (SHA-256 Asli)</th>
-                        <th>Tanggal Unggah</th>
-                        <th>Pilih Algoritma Unduh</th>
-                        <th>Aksi</th>
+                        <th>File ID</th>
+                        <th>Integrity Check (Original SHA-256)</th>
+                        <th>Uploaded</th>
+                        <th>Download (choose a copy)</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -72,15 +90,16 @@ File Terhubung:
                             <td><span class="hash-code">{{ item.sha256_orig[:16] }}...</span></td>
                             <td>{{ item.created_at }}</td>
                             <td>
-                                <!-- Pilihan Dekripsi per Algoritma (AES, DES, RC4) -->
-                                <a href="/download/{{ item.id }}/aes-gcm" class="btn btn-success">AES-GCM</a>
-                                <a href="/download/{{ item.id }}/des-cbc" class="btn btn-success">DES-CBC</a>
-                                <a href="/download/{{ item.id }}/rc4" class="btn btn-success">RC4</a>
+                                <!-- Decrypt one copy: AES, DES or RC4 -->
+                                <a href="{{ url_for('download_file', item_id=item.id, cipher_name='aes-gcm') }}" class="btn btn-success">AES-GCM</a>
+                                <a href="{{ url_for('download_file', item_id=item.id, cipher_name='des-cbc') }}" class="btn btn-success">DES-CBC</a>
+                                <a href="{{ url_for('download_file', item_id=item.id, cipher_name='rc4') }}" class="btn btn-success">RC4</a>
                             </td>
                             <td>
-                                <!-- Tombol Hapus Berkas -->
-                                <form action="/delete/{{ item.id }}" method="POST" style="display:inline;">
-                                    <button type="submit" class="btn btn-danger" onclick="return confirm('Apakah Anda yakin ingin menghapus berkas ini?')">Hapus</button>
+                                <!-- Delete file -->
+                                <form action="{{ url_for('delete_file', item_id=item.id) }}" method="POST" style="display:inline;">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button type="submit" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete this file?')">Delete</button>
                                 </form>
                             </td>
                         </tr>
@@ -88,7 +107,7 @@ File Terhubung:
                 </tbody>
             </table>
         {% else %}
-            <p style="color: #64748b;">Belum ada berkas terenkripsi yang diunggah.</p>
+            <p style="color: #64748b;">No encrypted files uploaded yet.</p>
         {% endif %}
     </div>
 </body>

@@ -4,7 +4,14 @@ import hmac
 import pytest
 from argon2.low_level import Type, hash_secret_raw
 
-from labcrypto.keys import derive_keys, new_salt
+from labcrypto.keys import (
+    IntegrityError,
+    derive_keys,
+    new_item_secret,
+    new_salt,
+    unwrap_secret,
+    wrap_secret,
+)
 
 
 SALT = b"0123456789abcdef"
@@ -105,6 +112,75 @@ def test_new_salt_is_accepted_by_derive_keys():
     login_key, kek = derive_keys("password", new_salt())
     assert len(login_key) == 32
     assert len(kek) == 32
+
+
+def test_new_item_secret_is_a_fresh_32_byte_value():
+    first = new_item_secret()
+    second = new_item_secret()
+    assert isinstance(first, bytes)
+    assert len(first) == 32
+    assert len(second) == 32
+    assert first != second
+
+
+def test_wrap_and_unwrap_secret_round_trip():
+    kek = b"k" * 32
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "aes-gcm")
+
+    wrapped = wrap_secret(kek, item_secret, ctx)
+
+    assert len(wrapped) == 12 + 32 + 16
+    assert unwrap_secret(kek, wrapped, ctx) == item_secret
+
+
+def test_wrapping_uses_a_fresh_nonce():
+    kek = b"k" * 32
+    item_secret = b"s" * 32
+    ctx = ("student-1", "item-1", "aes-gcm")
+
+    assert wrap_secret(kek, item_secret, ctx) != wrap_secret(kek, item_secret, ctx)
+
+
+@pytest.mark.parametrize("index", [0, 12, -1])
+def test_unwrap_rejects_tampered_wrapped_secret(index):
+    wrapped = wrap_secret(b"k" * 32, b"s" * 32, ("student-1", "item-1", "aes-gcm"))
+    tampered = bytearray(wrapped)
+    tampered[index] ^= 1
+
+    with pytest.raises(IntegrityError):
+        unwrap_secret(b"k" * 32, bytes(tampered), ("student-1", "item-1", "aes-gcm"))
+
+
+def test_unwrap_rejects_short_and_long_wrapped_secret():
+    wrapped = wrap_secret(b"k" * 32, b"s" * 32, ("student-1", "item-1", "aes-gcm"))
+
+    with pytest.raises(ValueError):
+        unwrap_secret(b"k" * 32, wrapped[:-1], ("student-1", "item-1", "aes-gcm"))
+    with pytest.raises(ValueError):
+        unwrap_secret(b"k" * 32, wrapped + b"x", ("student-1", "item-1", "aes-gcm"))
+
+
+@pytest.mark.parametrize(
+    ("wrap_ctx", "unwrap_ctx"),
+    [
+        (("student-1", "item-1", "aes-gcm"), ("student-2", "item-1", "aes-gcm")),
+        (("student-1", "item-1", "aes-gcm"), ("student-1", "item-2", "aes-gcm")),
+        (("student-1", "item-1", "aes-gcm"), ("student-1", "item-1", "rc4")),
+        (("1\x002", "3", "x"), ("1", "2\x003", "x")),
+    ],
+)
+def test_unwrap_rejects_different_context(wrap_ctx, unwrap_ctx):
+    wrapped = wrap_secret(b"k" * 32, b"s" * 32, wrap_ctx)
+    with pytest.raises(IntegrityError):
+        unwrap_secret(b"k" * 32, wrapped, unwrap_ctx)
+
+
+def test_unwrap_rejects_wrong_kek():
+    wrapped = wrap_secret(b"k" * 32, b"s" * 32, ("student-1", "item-1", "aes-gcm"))
+
+    with pytest.raises(IntegrityError):
+        unwrap_secret(b"z" * 32, wrapped, ("student-1", "item-1", "aes-gcm"))
 
 
 @pytest.mark.parametrize("salt", [b"a" * 16, b"a" * 32])

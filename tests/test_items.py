@@ -46,6 +46,42 @@ def test_aes_gcm_item_round_trip(plaintext):
     assert decrypt_item("aes-gcm", blob, item_secret, CTX) == plaintext
 
 
+@pytest.mark.parametrize("plaintext", [b"", b"hello", b"x" * (CHUNK_SIZE + 1)])
+def test_des_cbc_item_round_trip(plaintext):
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "des-cbc")
+
+    blob = encrypt_item("des-cbc", plaintext, item_secret, ctx)
+
+    assert decrypt_item("des-cbc", blob, item_secret, ctx) == plaintext
+
+
+def test_des_cbc_rejects_tampered_body_and_tag():
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "des-cbc")
+    blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["des-cbc"])
+
+    chunks[0][1][8] ^= 1
+    with pytest.raises(IntegrityError):
+        decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
+
+    blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["des-cbc"])
+    chunks[0][2][0] ^= 1
+    with pytest.raises(IntegrityError):
+        decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
+
+
+def test_des_cbc_verifies_before_decrypting():
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "des-cbc")
+    blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
+
+    with pytest.raises(IntegrityError):
+        decrypt_item("des-cbc", blob, new_item_secret(), ctx)
+
+
 def test_wrong_context_and_secret_fail_authentication():
     item_secret = new_item_secret()
     blob = encrypt_item("aes-gcm", b"private", item_secret, CTX)

@@ -112,7 +112,8 @@ def fmt_ms(seconds: str) -> str:
     return f"{ms:.3f}" if ms < 1 else f"{ms:.1f}"
 
 
-def write_tables(speed: list[dict], keys: list[dict], upload: list[dict], info: dict, out: Path) -> None:
+def write_tables(speed: list[dict], keys: list[dict], upload: list[dict], info: dict, out: Path,
+                 mac: list[dict] | None = None) -> None:
     lines = []
     if info.get("backend") != "real" or info.get("quick"):
         lines += ["> **TEST DATA ONLY - NOT FOR REPORT**", ""]
@@ -154,6 +155,33 @@ def write_tables(speed: list[dict], keys: list[dict], upload: list[dict], info: 
             lines.append(f"| {r['size']} | {fmt_ms(r['median_s'])} | {fmt_ms(r['min_s'])} | "
                          f"{fmt_ms(r['max_s'])} | {float(r['cv_pct']):.1f}% |")
 
+    if mac:
+        lines += ["", "### HMAC-SHA256 alone (same 1 MiB chunks as the app)", "",
+                  "| Size | Median (ms) | MiB/s | CV |", "|---|---|---|---|"]
+        for r in mac:
+            lines.append(f"| {r['size']} | {fmt_ms(r['median_s'])} | {float(r['median_mib_s']):.1f} | "
+                         f"{float(r['cv_pct']):.1f}% |")
+
+        # Split encrypt time of the HMAC'd ciphers into HMAC part and the rest (cipher + overhead).
+        mac_s = {int(r["size_bytes"]): float(r["median_s"]) for r in mac}
+        macd = [c for c in ("des-cbc", "rc4", "aes-cbc") if any(r["cipher"] == c for r in speed)]
+        if speed and macd:
+            enc = {(int(r["size_bytes"]), r["cipher"]): r for r in speed if r["op"] == "encrypt"}
+            sizes = sorted(s for s in mac_s if all((s, c) in enc for c in macd))
+            lines += ["", "### HMAC share of encrypt time (rest = cipher + per-item setup)", "",
+                      "| Size | " + " | ".join(f"{STYLE[c]['label']}: HMAC share / rest MiB/s" for c in macd) + " |",
+                      "|---" * (len(macd) + 1) + "|"]
+            for s in sizes:
+                cells = []
+                for c in macd:
+                    total = float(enc[(s, c)]["median_s"])
+                    rest = total - mac_s[s]
+                    rest_speed = f"{s / 2**20 / rest:.1f}" if rest > 0 else "n/a"
+                    cells.append(f"{mac_s[s] / total * 100:.0f}% / {rest_speed}")
+                lines.append(f"| {enc[(s, macd[0])]['size']} | " + " | ".join(cells) + " |")
+            lines += ["", "_HMAC and cipher medians come from separate runs, so shares are estimates. "
+                      "'n/a' = HMAC median was longer than the whole encrypt median (noise)._"]
+
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -169,11 +197,12 @@ def main() -> None:
     speed = read_csv(d / "cipher_speed.csv") if (d / "cipher_speed.csv").exists() else []
     keys = read_csv(d / "key_cost.csv") if (d / "key_cost.csv").exists() else []
     upload = read_csv(d / "upload_cost.csv") if (d / "upload_cost.csv").exists() else []
+    mac = read_csv(d / "mac_cost.csv") if (d / "mac_cost.csv").exists() else []
 
     if speed:
         plot_speed(speed, info, d / "cipher_speed.png")
         print(f"Chart:  {d / 'cipher_speed.png'}")
-    write_tables(speed, keys, upload, info, d / "tables.md")
+    write_tables(speed, keys, upload, info, d / "tables.md", mac)
     print(f"Tables: {d / 'tables.md'}")
 
 

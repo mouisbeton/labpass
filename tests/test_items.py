@@ -3,17 +3,23 @@ import struct
 import pytest
 
 import labcrypto.items as items_module
-from labcrypto.items import CHUNK_SIZE, decrypt_item, encrypt_item
+from labcrypto.items import (
+    APP_CIPHERS,
+    BENCHMARK_CIPHERS,
+    CHUNK_SIZE,
+    decrypt_item,
+    encrypt_item,
+)
 from labcrypto.keys import IntegrityError, new_item_secret
 
 
 CTX = ("student-1", "item-1", "aes-gcm")
-TAG_LENGTHS = {"aes-gcm": 16, "des-cbc": 32, "rc4": 32}
+TAG_LENGTHS = {"aes-gcm": 16, "aes-cbc": 32, "des-cbc": 32, "rc4": 32}
 PREFIX_LENGTH = 4 + 16
 HEADER_LENGTH = 9
 
 
-@pytest.fixture(params=["aes-gcm", "des-cbc", "rc4"])
+@pytest.fixture(params=["aes-gcm", "aes-cbc", "des-cbc", "rc4"])
 def cipher_name(request):
     return request.param
 
@@ -43,6 +49,7 @@ def join_chunks(prefix, chunks):
 @pytest.mark.parametrize(
     "plaintext",
     [b"", b"hello", b"x" * 8, b"x" * CHUNK_SIZE, b"x" * (CHUNK_SIZE * 2), b"x" * (CHUNK_SIZE + 1)],
+    ids=["empty", "small", "one-block", "one-chunk", "two-chunks", "one-chunk-plus-one"],
 )
 def test_item_round_trip(cipher_name, plaintext):
     item_secret = new_item_secret()
@@ -70,20 +77,30 @@ def test_des_cbc_rejects_tampered_body_and_tag():
         decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
 
 
-def test_des_cbc_verifies_before_decrypting(monkeypatch):
+@pytest.mark.parametrize("cipher_name", ["des-cbc", "aes-cbc"])
+def test_cbc_verifies_before_decrypting(monkeypatch, cipher_name):
     item_secret = new_item_secret()
-    ctx = ("student-1", "item-1", "des-cbc")
-    blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["des-cbc"])
-    # Byte 7 is the last IV byte; CBC flips the final plaintext byte, the padding byte.
-    chunks[0][1][7] ^= 1
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
+    iv_last_byte = 7 if cipher_name == "des-cbc" else 15
+    chunks[0][1][iv_last_byte] ^= 1
 
     def fail_if_decrypted(*args, **kwargs):
-        raise AssertionError("DES decryption must not run before HMAC verification")
+        raise AssertionError("CBC decryption must not run before HMAC verification")
 
-    monkeypatch.setattr(items_module.DES, "new", fail_if_decrypted)
+    if cipher_name == "des-cbc":
+        monkeypatch.setattr(items_module.DES, "new", fail_if_decrypted)
+    else:
+        monkeypatch.setattr(items_module.AES, "new", fail_if_decrypted)
     with pytest.raises(IntegrityError):
-        decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks), item_secret, ctx)
+
+
+def test_cipher_sets_separate_application_and_benchmark_ciphers():
+    assert APP_CIPHERS == frozenset({"aes-gcm", "des-cbc", "rc4"})
+    assert BENCHMARK_CIPHERS == frozenset({"aes-cbc"})
+    assert APP_CIPHERS.isdisjoint(BENCHMARK_CIPHERS)
 
 
 def test_rc4_rejects_tampered_body_and_tag():
@@ -101,6 +118,23 @@ def test_rc4_rejects_tampered_body_and_tag():
     chunks[0][2][0] ^= 1
     with pytest.raises(IntegrityError):
         decrypt_item("rc4", join_chunks(prefix, chunks), item_secret, ctx)
+
+
+def test_aes_cbc_rejects_tampered_body_and_tag():
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "aes-cbc")
+    blob = encrypt_item("aes-cbc", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-cbc"])
+
+    chunks[0][1][16] ^= 1
+    with pytest.raises(IntegrityError):
+        decrypt_item("aes-cbc", join_chunks(prefix, chunks), item_secret, ctx)
+
+    blob = encrypt_item("aes-cbc", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-cbc"])
+    chunks[0][2][0] ^= 1
+    with pytest.raises(IntegrityError):
+        decrypt_item("aes-cbc", join_chunks(prefix, chunks), item_secret, ctx)
 
 
 def test_wrong_context_and_secret_fail_authentication():

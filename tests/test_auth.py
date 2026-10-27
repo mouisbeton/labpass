@@ -15,6 +15,7 @@ from flask import Flask
 
 import auth
 import database
+import session_cache
 from labcrypto import derive_keys
 
 TEMPLATES = os.path.join(os.path.dirname(__file__), "..", "templates")
@@ -36,6 +37,7 @@ def _make_app(tmp_path, monkeypatch, csrf_enabled):
     app = Flask(__name__, template_folder=TEMPLATES)
     app.config.update(TESTING=True, SECRET_KEY="test", WTF_CSRF_ENABLED=csrf_enabled)
     auth.init_app(app)
+    app.add_url_rule("/dashboard", "dashboard", lambda: "dashboard")
     return app
 
 
@@ -205,3 +207,94 @@ def test_check_login_unknown_username_still_runs_argon2(client, monkeypatch):
     with client.application.app_context():
         assert auth.check_login("tidak.ada", VALID_FORM["password"]) is None
     assert len(calls) == 1
+
+
+# Login route and logout
+
+
+@pytest.fixture
+def registered(client, monkeypatch):
+    # Start every login test with an empty KEK cache, as the cache tests do
+    monkeypatch.setattr(session_cache, "_entries", {})
+    client.post("/register", data=VALID_FORM)
+    return client
+
+
+LOGIN_FORM = {"username": VALID_FORM["username"], "password": VALID_FORM["password"]}
+
+
+def test_login_page_loads(client):
+    response = client.get("/login")
+    assert response.status_code == 200
+    assert b"Log In" in response.data
+
+
+def test_register_redirects_to_login(client):
+    response = client.post("/register", data=VALID_FORM)
+    assert response.headers["Location"] == "/login"
+
+
+def test_correct_login_creates_one_cache_entry(registered):
+    response = registered.post("/login", data=LOGIN_FORM)
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/dashboard"
+    assert len(session_cache._entries) == 1
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        {**LOGIN_FORM, "password": "password-yang-salah"},
+        {**LOGIN_FORM, "username": "tidak.ada"},
+    ],
+)
+def test_failed_login_gives_401_and_one_message(registered, form):
+    response = registered.post("/login", data=form)
+    assert response.status_code == 401
+    assert auth.LOGIN_FAILED.encode() in response.data
+    assert session_cache._entries == {}
+
+
+def test_cookie_holds_only_the_session_id(registered):
+    registered.post("/login", data=LOGIN_FORM)
+    with registered.session_transaction() as s:
+        assert list(s.keys()) == ["sid"]
+        sid = s["sid"]
+
+    user_id, kek = session_cache.get(sid)
+    assert kek not in sid.encode()
+
+
+def test_session_cookie_flags(registered):
+    response = registered.post("/login", data=LOGIN_FORM)
+    cookie = response.headers["Set-Cookie"]
+    assert "Secure" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+
+
+def test_logout_removes_cache_entry_and_sid(registered):
+    registered.post("/login", data=LOGIN_FORM)
+    response = registered.post("/logout")
+    assert response.status_code == 302
+    assert session_cache._entries == {}
+    with registered.session_transaction() as s:
+        assert "sid" not in s
+
+
+def test_logout_is_post_only(registered):
+    assert registered.get("/logout").status_code == 405
+
+
+def test_logging_in_twice_gives_a_new_sid(registered):
+    registered.post("/login", data=LOGIN_FORM)
+    with registered.session_transaction() as s:
+        first = s["sid"]
+
+    registered.post("/login", data=LOGIN_FORM)
+    with registered.session_transaction() as s:
+        second = s["sid"]
+
+    assert first != second
+    # the first session's KEK was wiped, not left behind
+    assert list(session_cache._entries) == [second]

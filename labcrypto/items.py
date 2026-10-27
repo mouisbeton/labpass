@@ -174,16 +174,15 @@ def decrypt_item(
                 raise IntegrityError("invalid DES body length")
             if not last and len(body) != _DES_IV_LENGTH + CHUNK_SIZE + _DES_BLOCK_SIZE:
                 raise IntegrityError("invalid chunk length")
+            if last and len(body) > _DES_IV_LENGTH + CHUNK_SIZE + _DES_BLOCK_SIZE:
+                raise IntegrityError("invalid chunk length")
             des_key, mac_key = _des_keys(item_secret, ctx, salt, index)
             expected_tag = hmac.new(mac_key, context + header + body, hashlib.sha256).digest()
             if not hmac.compare_digest(tag, expected_tag):
                 raise IntegrityError("chunk failed authentication")
             iv = body[:_DES_IV_LENGTH]
-            try:
-                decrypted = DES.new(des_key, DES.MODE_CBC, iv).decrypt(body[_DES_IV_LENGTH:])
-                plaintext.extend(_pkcs7_unpad(decrypted))
-            except ValueError as exc:
-                raise IntegrityError("chunk failed authentication") from exc
+            decrypted = DES.new(des_key, DES.MODE_CBC, iv).decrypt(body[_DES_IV_LENGTH:])
+            plaintext.extend(_pkcs7_unpad(decrypted))
 
         expected_index += 1
         if last:

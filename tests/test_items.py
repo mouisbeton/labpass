@@ -2,6 +2,7 @@ import struct
 
 import pytest
 
+import labcrypto.items as items_module
 from labcrypto.items import CHUNK_SIZE, decrypt_item, encrypt_item
 from labcrypto.keys import IntegrityError, new_item_secret
 
@@ -10,6 +11,11 @@ CTX = ("student-1", "item-1", "aes-gcm")
 TAG_LENGTHS = {"aes-gcm": 16, "des-cbc": 32, "rc4": 32}
 PREFIX_LENGTH = 4 + 16
 HEADER_LENGTH = 9
+
+
+@pytest.fixture(params=["aes-gcm", "des-cbc"])
+def cipher_name(request):
+    return request.param
 
 
 def split_chunks(blob, tag_length):
@@ -36,24 +42,15 @@ def join_chunks(prefix, chunks):
 
 @pytest.mark.parametrize(
     "plaintext",
-    [b"", b"hello", b"x" * CHUNK_SIZE, b"x" * (CHUNK_SIZE * 2), b"x" * (CHUNK_SIZE + 1)],
+    [b"", b"hello", b"x" * 8, b"x" * CHUNK_SIZE, b"x" * (CHUNK_SIZE * 2), b"x" * (CHUNK_SIZE + 1)],
 )
-def test_aes_gcm_item_round_trip(plaintext):
+def test_item_round_trip(cipher_name, plaintext):
     item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", cipher_name)
 
-    blob = encrypt_item("aes-gcm", plaintext, item_secret, CTX)
+    blob = encrypt_item(cipher_name, plaintext, item_secret, ctx)
 
-    assert decrypt_item("aes-gcm", blob, item_secret, CTX) == plaintext
-
-
-@pytest.mark.parametrize("plaintext", [b"", b"hello", b"x" * (CHUNK_SIZE + 1)])
-def test_des_cbc_item_round_trip(plaintext):
-    item_secret = new_item_secret()
-    ctx = ("student-1", "item-1", "des-cbc")
-
-    blob = encrypt_item("des-cbc", plaintext, item_secret, ctx)
-
-    assert decrypt_item("des-cbc", blob, item_secret, ctx) == plaintext
+    assert decrypt_item(cipher_name, blob, item_secret, ctx) == plaintext
 
 
 def test_des_cbc_rejects_tampered_body_and_tag():
@@ -73,13 +70,20 @@ def test_des_cbc_rejects_tampered_body_and_tag():
         decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
 
 
-def test_des_cbc_verifies_before_decrypting():
+def test_des_cbc_verifies_before_decrypting(monkeypatch):
     item_secret = new_item_secret()
     ctx = ("student-1", "item-1", "des-cbc")
     blob = encrypt_item("des-cbc", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["des-cbc"])
+    # Byte 7 is the last IV byte; CBC flips the final plaintext byte, the padding byte.
+    chunks[0][1][7] ^= 1
 
+    def fail_if_decrypted(*args, **kwargs):
+        raise AssertionError("DES decryption must not run before HMAC verification")
+
+    monkeypatch.setattr(items_module.DES, "new", fail_if_decrypted)
     with pytest.raises(IntegrityError):
-        decrypt_item("des-cbc", blob, new_item_secret(), ctx)
+        decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
 
 
 def test_wrong_context_and_secret_fail_authentication():
@@ -176,22 +180,24 @@ def test_deleted_final_chunk_fails():
         decrypt_item("aes-gcm", join_chunks(prefix, chunks[:-1]), item_secret, CTX)
 
 
-def test_deleted_final_chunk_with_moved_last_flag_fails():
+def test_deleted_final_chunk_with_moved_last_flag_fails(cipher_name):
     item_secret = new_item_secret()
-    blob = encrypt_item("aes-gcm", b"a" * (CHUNK_SIZE * 2) + b"b", item_secret, CTX)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-gcm"])
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"a" * (CHUNK_SIZE * 2) + b"b", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
     chunks[1][0][4] = 1
 
     with pytest.raises(IntegrityError):
-        decrypt_item("aes-gcm", join_chunks(prefix, chunks[:2]), item_secret, CTX)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks[:2]), item_secret, ctx)
 
 
-def test_non_final_chunk_must_have_full_chunk_length():
+def test_non_final_chunk_must_have_full_chunk_length(cipher_name):
     item_secret = new_item_secret()
-    blob = encrypt_item("aes-gcm", b"a" * (CHUNK_SIZE + 1), item_secret, CTX)
-    prefix, chunks = split_chunks(blob, TAG_LENGTHS["aes-gcm"])
-    chunks[0][1] = chunks[0][1][:-1]
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"a" * (CHUNK_SIZE + 1), item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
+    chunks[0][1] = chunks[0][1][:-8]
     struct.pack_into(">I", chunks[0][0], 5, len(chunks[0][1]))
 
     with pytest.raises(IntegrityError, match="invalid chunk length"):
-        decrypt_item("aes-gcm", join_chunks(prefix, chunks), item_secret, CTX)
+        decrypt_item(cipher_name, join_chunks(prefix, chunks), item_secret, ctx)

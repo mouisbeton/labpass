@@ -13,7 +13,7 @@ PREFIX_LENGTH = 4 + 16
 HEADER_LENGTH = 9
 
 
-@pytest.fixture(params=["aes-gcm", "des-cbc"])
+@pytest.fixture(params=["aes-gcm", "des-cbc", "rc4"])
 def cipher_name(request):
     return request.param
 
@@ -86,6 +86,23 @@ def test_des_cbc_verifies_before_decrypting(monkeypatch):
         decrypt_item("des-cbc", join_chunks(prefix, chunks), item_secret, ctx)
 
 
+def test_rc4_rejects_tampered_body_and_tag():
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "rc4")
+    blob = encrypt_item("rc4", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["rc4"])
+
+    chunks[0][1][0] ^= 1
+    with pytest.raises(IntegrityError):
+        decrypt_item("rc4", join_chunks(prefix, chunks), item_secret, ctx)
+
+    blob = encrypt_item("rc4", b"private", item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["rc4"])
+    chunks[0][2][0] ^= 1
+    with pytest.raises(IntegrityError):
+        decrypt_item("rc4", join_chunks(prefix, chunks), item_secret, ctx)
+
+
 def test_wrong_context_and_secret_fail_authentication():
     item_secret = new_item_secret()
     blob = encrypt_item("aes-gcm", b"private", item_secret, CTX)
@@ -96,18 +113,38 @@ def test_wrong_context_and_secret_fail_authentication():
         decrypt_item("aes-gcm", blob, new_item_secret(), CTX)
 
 
-def test_each_encryption_uses_a_fresh_hkdf_salt():
+def test_each_encryption_uses_a_fresh_hkdf_salt(cipher_name):
     item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", cipher_name)
 
-    first = encrypt_item("aes-gcm", b"private", item_secret, CTX)
-    second = encrypt_item("aes-gcm", b"private", item_secret, CTX)
+    first = encrypt_item(cipher_name, b"private", item_secret, ctx)
+    second = encrypt_item(cipher_name, b"private", item_secret, ctx)
 
-    first_prefix, first_chunks = split_chunks(first, TAG_LENGTHS["aes-gcm"])
-    second_prefix, second_chunks = split_chunks(second, TAG_LENGTHS["aes-gcm"])
+    first_prefix, first_chunks = split_chunks(first, TAG_LENGTHS[cipher_name])
+    second_prefix, second_chunks = split_chunks(second, TAG_LENGTHS[cipher_name])
     assert first_prefix != second_prefix
     assert first_chunks[0][1] != second_chunks[0][1]
-    assert decrypt_item("aes-gcm", first, item_secret, CTX) == b"private"
-    assert decrypt_item("aes-gcm", second, item_secret, CTX) == b"private"
+    assert decrypt_item(cipher_name, first, item_secret, ctx) == b"private"
+    assert decrypt_item(cipher_name, second, item_secret, ctx) == b"private"
+
+
+def test_different_keys_per_chunk(cipher_name):
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", cipher_name)
+    blob = encrypt_item(cipher_name, b"a" * (CHUNK_SIZE * 2), item_secret, ctx)
+    _, chunks = split_chunks(blob, TAG_LENGTHS[cipher_name])
+
+    assert chunks[0][1] != chunks[1][1]
+
+
+def test_rc4_drops_3072_bytes_before_encrypting():
+    item_secret = new_item_secret()
+    ctx = ("student-1", "item-1", "rc4")
+    blob = encrypt_item("rc4", bytes(100), item_secret, ctx)
+    prefix, chunks = split_chunks(blob, TAG_LENGTHS["rc4"])
+    key, _ = items_module._rc4_keys(item_secret, ctx, bytes(prefix[4:20]), 0)
+
+    assert bytes(chunks[0][1]) == items_module.ARC4.new(key).encrypt(bytes(3072 + 100))[3072:]
 
 
 def test_cipher_name_must_match_context():

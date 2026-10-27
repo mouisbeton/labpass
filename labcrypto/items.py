@@ -23,10 +23,14 @@ from .keys import (
 
 
 CHUNK_SIZE: Final = 1024 * 1024
+APP_CIPHERS: Final = frozenset({"aes-gcm", "des-cbc", "rc4"})
+BENCHMARK_CIPHERS: Final = frozenset({"aes-cbc"})
 _MAGIC: Final = b"LAC1"
 _NONCE_LENGTH: Final = 12
 _DES_IV_LENGTH: Final = 8
+_AES_IV_LENGTH: Final = 16
 _DES_BLOCK_SIZE: Final = 8
+_AES_BLOCK_SIZE: Final = 16
 _HMAC_LENGTH: Final = 32
 _RC4_DROP_LENGTH: Final = 3072
 _HEADER_FORMAT: Final = ">IBI"
@@ -72,6 +76,19 @@ def _rc4_keys(item_secret: bytes, ctx: ItemContext, salt: bytes, index: int) -> 
     return material[:32], material[32:]
 
 
+def _aes_cbc_keys(
+    item_secret: bytes, ctx: ItemContext, salt: bytes, index: int
+) -> tuple[bytes, bytes]:
+    material = HKDF(
+        item_secret,
+        32 + _HMAC_LENGTH,
+        salt=salt,
+        hashmod=SHA256,
+        context=b"labaccess/aes-cbc/" + _context_bytes(ctx) + index.to_bytes(8, "big"),
+    )
+    return material[:32], material[32:]
+
+
 def _rc4_crypt(key: bytes, data: bytes) -> bytes:
     cipher = ARC4.new(key)
     cipher.encrypt(b"\x00" * _RC4_DROP_LENGTH)
@@ -92,6 +109,22 @@ def _pkcs7_unpad(data: bytes) -> bytes:
     return data[:-padding]
 
 
+def _pkcs7_pad_aes(data: bytes) -> bytes:
+    padding = _AES_BLOCK_SIZE - (len(data) % _AES_BLOCK_SIZE)
+    return data + bytes([padding]) * padding
+
+
+def _pkcs7_unpad_aes(data: bytes) -> bytes:
+    if not data or len(data) % _AES_BLOCK_SIZE:
+        raise IntegrityError("invalid AES padding")
+    padding = data[-1]
+    if padding < 1 or padding > _AES_BLOCK_SIZE:
+        raise IntegrityError("invalid AES padding")
+    if data[-padding:] != bytes([padding]) * padding:
+        raise IntegrityError("invalid AES padding")
+    return data[:-padding]
+
+
 def encrypt_item(
     cipher_name: str,
     plaintext: bytes,
@@ -99,7 +132,7 @@ def encrypt_item(
     ctx: ItemContext,
 ) -> bytes:
     """Encrypt an item; use a new item secret for every write."""
-    if cipher_name not in ("aes-gcm", "des-cbc", "rc4"):
+    if cipher_name not in APP_CIPHERS | BENCHMARK_CIPHERS:
         raise ValueError("unsupported cipher")
     if not isinstance(plaintext, bytes):
         raise TypeError("plaintext must be bytes")
@@ -125,6 +158,15 @@ def encrypt_item(
             cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=GCM_TAG_LENGTH)
             cipher.update(aad)
             body, tag = cipher.encrypt_and_digest(chunk)
+        elif cipher_name == "aes-cbc":
+            aes_key, mac_key = _aes_cbc_keys(item_secret, ctx, salt, index)
+            iv = secrets.token_bytes(_AES_IV_LENGTH)
+            body = iv + AES.new(
+                aes_key, AES.MODE_CBC, iv
+            ).encrypt(_pkcs7_pad_aes(bytes(chunk)))
+            header = struct.pack(_HEADER_FORMAT, index, int(last), len(body))
+            aad = context + header
+            tag = hmac.new(mac_key, aad + body, hashlib.sha256).digest()
         elif cipher_name == "des-cbc":
             des_key, mac_key = _des_keys(item_secret, ctx, salt, index)
             iv = secrets.token_bytes(_DES_IV_LENGTH)
@@ -150,7 +192,7 @@ def decrypt_item(
     item_secret: bytes,
     ctx: ItemContext,
 ) -> bytes:
-    if cipher_name not in ("aes-gcm", "des-cbc", "rc4"):
+    if cipher_name not in APP_CIPHERS | BENCHMARK_CIPHERS:
         raise ValueError("unsupported cipher")
     if not isinstance(blob, bytes):
         raise TypeError("blob must be bytes")
@@ -196,6 +238,24 @@ def decrypt_item(
                 plaintext.extend(cipher.decrypt_and_verify(body, tag))
             except ValueError as exc:
                 raise IntegrityError("chunk failed authentication") from exc
+        elif cipher_name == "aes-cbc":
+            if not last and len(body) != _AES_IV_LENGTH + CHUNK_SIZE + _AES_BLOCK_SIZE:
+                raise IntegrityError("invalid chunk length")
+            if len(body) < _AES_IV_LENGTH + _AES_BLOCK_SIZE or (
+                len(body) - _AES_IV_LENGTH
+            ) % _AES_BLOCK_SIZE:
+                raise IntegrityError("invalid AES body length")
+            if last and len(body) > _AES_IV_LENGTH + CHUNK_SIZE + _AES_BLOCK_SIZE:
+                raise IntegrityError("invalid chunk length")
+            aes_key, mac_key = _aes_cbc_keys(item_secret, ctx, salt, index)
+            expected_tag = hmac.new(mac_key, context + header + body, hashlib.sha256).digest()
+            if not hmac.compare_digest(tag, expected_tag):
+                raise IntegrityError("chunk failed authentication")
+            iv = body[:_AES_IV_LENGTH]
+            decrypted = AES.new(
+                aes_key, AES.MODE_CBC, iv
+            ).decrypt(body[_AES_IV_LENGTH:])
+            plaintext.extend(_pkcs7_unpad_aes(decrypted))
         elif cipher_name == "des-cbc":
             if len(body) < _DES_IV_LENGTH + _DES_BLOCK_SIZE or (len(body) - _DES_IV_LENGTH) % _DES_BLOCK_SIZE:
                 raise IntegrityError("invalid DES body length")

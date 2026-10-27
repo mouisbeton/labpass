@@ -77,7 +77,7 @@ def unwrap_secret(kek: bytes, wrapped: bytes, ctx: ItemContext) -> bytes:
         raise TypeError("wrapped must be bytes")
     expected_length = GCM_NONCE_LENGTH + ITEM_SECRET_LENGTH + GCM_TAG_LENGTH
     if len(wrapped) != expected_length:
-        raise ValueError("wrapped secret has an invalid length")
+        raise IntegrityError("wrapped secret has an invalid length")
 
     nonce = wrapped[:GCM_NONCE_LENGTH]
     ciphertext = wrapped[GCM_NONCE_LENGTH:-GCM_TAG_LENGTH]

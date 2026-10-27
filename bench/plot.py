@@ -60,8 +60,11 @@ def plot_speed(rows: list[dict], info: dict, out: Path) -> None:
             lo = [m - s / 2**20 / float(by_size[s]["max_s"]) for m, s in zip(med, sizes)]
             hi = [s / 2**20 / float(by_size[s]["min_s"]) - m for m, s in zip(med, sizes)]
             st = STYLE[c]
+            label = st["label"]
+            if info.get("cipher_code", {}).get(c) == "stub":
+                label += " [stub]"
             ax.errorbar(xs, med, yerr=[lo, hi], color=st["color"], marker=st["marker"],
-                        ls=st["ls"], lw=2, ms=6, capsize=3, elinewidth=1, label=st["label"])
+                        ls=st["ls"], lw=2, ms=6, capsize=3, elinewidth=1, label=label)
             ends.append([med[-1], st["label"].split(" (")[0].split(" +")[0]])
 
         # direct label at each line end so identity never relies on colour alone;

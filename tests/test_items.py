@@ -49,6 +49,7 @@ def join_chunks(prefix, chunks):
 @pytest.mark.parametrize(
     "plaintext",
     [b"", b"hello", b"x" * 8, b"x" * CHUNK_SIZE, b"x" * (CHUNK_SIZE * 2), b"x" * (CHUNK_SIZE + 1)],
+    ids=["empty", "small", "one-block", "one-chunk", "two-chunks", "one-chunk-plus-one"],
 )
 def test_item_round_trip(cipher_name, plaintext):
     item_secret = new_item_secret()

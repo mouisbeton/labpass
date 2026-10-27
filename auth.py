@@ -14,10 +14,11 @@ import sqlite3
 import uuid
 from datetime import date, datetime, timezone
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, flash, redirect, render_template, request, session, url_for
 from flask_wtf import CSRFProtect
 
 import database
+import session_cache
 from labcrypto import derive_keys, new_salt
 
 bp = Blueprint("auth", __name__)
@@ -29,6 +30,9 @@ USERNAME_PATTERN = re.compile(r"[a-z0-9_.-]{3,32}")
 # Our campus NRP consists of 10 digits; adjust this if the format differs
 NRP_PATTERN = re.compile(r"\d{10}")
 MIN_PASSWORD_LENGTH = 12
+
+# One message for every login failure, so attackers cannot tell which usernames exist
+LOGIN_FAILED = "Wrong username or password."
 
 # Current consent text version; previous versions are retained for auditing historical consent
 CONSENT_VERSION = "v1"
@@ -65,6 +69,12 @@ def init_auth_db():
 
 # Attach the auth module to the Flask application; call this once from app.py
 def init_app(app):
+    app.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+    )
+
     # Enable CSRF protection for all POST forms throughout the application, including the dashboard
     csrf.init_app(app)
     app.teardown_appcontext(database.close_db)
@@ -206,5 +216,47 @@ def register():
 
     flash("Account created successfully. Please log in.")
 
-    # TODO Step 2: redirect to the login page once the login route has been implemented
-    return redirect(url_for("auth.register"))
+    return redirect(url_for("auth.login"))
+
+
+@bp.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html", errors=[], username="")
+
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    result = check_login(username, password)
+
+    if result is None:
+        return render_template(
+            "login.html",
+            errors=[LOGIN_FAILED],
+            username=username.strip().lower(),
+        ), 401
+
+    user_id, kek = result
+
+    # Fresh session at every login (prevents session fixation): drop any old cache entry,
+    # empty the cookie, then store only the new random session ID in it
+    old_sid = session.get("sid")
+    if old_sid:
+        session_cache.delete(old_sid)
+    session.clear()
+    session["sid"] = session_cache.create(user_id, kek)
+
+    # "dashboard" is the endpoint name of Person 3's dashboard route in app.py
+    return redirect(url_for("dashboard"))
+
+
+# POST only: a link or image on another site cannot log a student out, and CSRF protects the form
+@bp.route("/logout", methods=["POST"])
+def logout():
+    sid = session.get("sid")
+    if sid:
+        # Wipes the KEK from server RAM
+        session_cache.delete(sid)
+    session.clear()
+
+    flash("You have been logged out.")
+    return redirect(url_for("auth.login"))

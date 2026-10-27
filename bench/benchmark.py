@@ -29,6 +29,7 @@ import gc
 import hashlib
 import hmac
 import json
+import math
 import os
 import platform
 import statistics
@@ -48,10 +49,11 @@ QUICK_SIZES = [1 * KiB, 100 * KiB, 1 * MiB]
 APP_CIPHERS = ("aes-gcm", "des-cbc", "rc4")
 BENCH_CIPHERS = APP_CIPHERS + ("aes-cbc",)  # aes-cbc = control, benchmark only
 
-# Small inputs finish in microseconds, below reliable timer resolution.
-# Repeat them inside one timed run until each run covers ~1 MiB of work,
-# then divide. Sizes >= 1 MiB run once per timed run.
-MIN_BYTES_PER_RUN = 1 * MiB
+# A timed run that lasts only a few ms is easily disturbed by Windows (an
+# interrupt or a core switch can double it). So each timed run repeats the
+# operation until it lasts at least this long, then divides by the repeats.
+# The repeat count is measured once per measurement, before the timed runs.
+TARGET_RUN_SECONDS = 0.25
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -148,6 +150,21 @@ def timed(fn, inner: int = 1) -> float:
     return (time.perf_counter() - start) / inner
 
 
+def calibrate(fn) -> int:
+    """How many back-to-back calls of fn() make one timed run last ~TARGET_RUN_SECONDS.
+    Doubles the count until the batch takes >= 1/10 of the target, then scales up."""
+    fn()  # warm up caches and imports
+    n = 1
+    while True:
+        start = time.perf_counter()
+        for _ in range(n):
+            fn()
+        elapsed = time.perf_counter() - start
+        if elapsed >= TARGET_RUN_SECONDS / 10:
+            return max(1, math.ceil(n * TARGET_RUN_SECONDS / elapsed))
+        n *= 2
+
+
 # ---------------------------------------------------------------- 3. key cost
 
 def bench_keys(warmup: int, runs: int, raw_rows: list) -> list[dict]:
@@ -159,14 +176,13 @@ def bench_keys(warmup: int, runs: int, raw_rows: list) -> list[dict]:
     wrapped = wrap_secret(kek, secret, ctx)
 
     ops = {
-        # derive_keys is ~0.1-1 s, one call per run is plenty
-        "derive_keys": (lambda: derive_keys("benchmark password", salt), 1),
-        # wrap/unwrap are microseconds, so batch them
-        "wrap_secret": (lambda: wrap_secret(kek, secret, ctx), 1000),
-        "unwrap_secret": (lambda: unwrap_secret(kek, wrapped, ctx), 1000),
+        "derive_keys": lambda: derive_keys("benchmark password", salt),
+        "wrap_secret": lambda: wrap_secret(kek, secret, ctx),
+        "unwrap_secret": lambda: unwrap_secret(kek, wrapped, ctx),
     }
     rows = []
-    for op, (fn, inner) in ops.items():
+    for op, fn in ops.items():
+        inner = calibrate(fn)
         times = []
         for r in range(warmup + runs):
             t = timed(fn, inner)
@@ -188,7 +204,14 @@ def bench_ciphers(sizes, warmup, runs, enc, dec, raw_rows, ciphers=BENCH_CIPHERS
     rows = []
     for size in sizes:
         data = os.urandom(size)  # generated outside the timer
-        inner = max(1, MIN_BYTES_PER_RUN // size)
+        # repeat counts per cipher and direction, so every timed run lasts ~TARGET_RUN_SECONDS
+        inner = {}
+        for c in ciphers:
+            ctx = ("bench-user", f"calibrate-{size}", c)
+            secret = new_item_secret()
+            blob = enc(c, data, secret, ctx)
+            inner[(c, "encrypt")] = calibrate(lambda: enc(c, data, secret, ctx))
+            inner[(c, "decrypt")] = calibrate(lambda: dec(c, blob, secret, ctx))
         times = {(c, op): [] for c in ciphers for op in ("encrypt", "decrypt")}
         overhead = {}
         for r in range(warmup + runs):
@@ -198,8 +221,8 @@ def bench_ciphers(sizes, warmup, runs, enc, dec, raw_rows, ciphers=BENCH_CIPHERS
                 ctx = ("bench-user", f"item-{size}-{r}", c)
                 secret = new_item_secret()  # fresh secret per write, as in the app
                 blob = enc(c, data, secret, ctx)
-                t_enc = timed(lambda: enc(c, data, secret, ctx), inner)
-                t_dec = timed(lambda: dec(c, blob, secret, ctx), inner)
+                t_enc = timed(lambda: enc(c, data, secret, ctx), inner[(c, "encrypt")])
+                t_dec = timed(lambda: dec(c, blob, secret, ctx), inner[(c, "decrypt")])
                 # a fast wrong answer doesn't count: check the round trip
                 if dec(c, blob, secret, ctx) != data:
                     sys.exit(f"ROUND TRIP FAILED: {c} at {size_label(size)}")
@@ -217,7 +240,7 @@ def bench_ciphers(sizes, warmup, runs, enc, dec, raw_rows, ciphers=BENCH_CIPHERS
                 mib_s = size / MiB / s["median_s"]
                 rows.append({
                     "size_bytes": size, "size": size_label(size), "cipher": c, "op": op,
-                    "inner_reps": inner, **s, "median_mib_s": mib_s,
+                    "inner_reps": inner[(c, op)], **s, "median_mib_s": mib_s,
                     "overhead_bytes": overhead[c],
                     "overhead_pct": overhead[c] / size * 100,
                 })
@@ -237,7 +260,6 @@ def bench_upload(sizes, warmup, runs, enc, raw_rows) -> list[dict]:
     rows = []
     for size in sizes:
         data = os.urandom(size)
-        inner = max(1, MIN_BYTES_PER_RUN // size)
 
         def upload():
             for c in APP_CIPHERS:
@@ -246,6 +268,7 @@ def bench_upload(sizes, warmup, runs, enc, raw_rows) -> list[dict]:
                 wrap_secret(kek, secret, ctx)
                 enc(c, data, secret, ctx)
 
+        inner = calibrate(upload)
         times = []
         for r in range(warmup + runs):
             t = timed(upload, inner)
@@ -282,7 +305,7 @@ def bench_mac(sizes, warmup, runs, raw_rows) -> list[dict]:
     rows = []
     for size in sizes:
         data = os.urandom(size)
-        inner = max(1, MIN_BYTES_PER_RUN // size)
+        inner = calibrate(lambda: mac_only(key, data))
         times = []
         for r in range(warmup + runs):
             t = timed(lambda: mac_only(key, data), inner)
